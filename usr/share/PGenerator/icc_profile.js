@@ -1236,8 +1236,16 @@ function meterIccApplyCompanionCorrectionAvailability(){
  // HDR slot. Conflating the two made the label revert the moment a capable
  // Linux Companion connected.
  const isLinux=meterIccCompanionPlatform==='linux';
- const cannotReadProfile=isLinux&&
-  (!meterIccCompanionVersion||meterIccVersionBelow(meterIccCompanionVersion,'1.4.2'));
+ const isMac=meterIccCompanionPlatform==='macos';
+ // Two different reasons to withdraw the application-managed modes, and they
+ // are not the same reason. A pre-1.4.2 Linux Companion could not READ the
+ // active profile. A macOS Companion reads it perfectly well, but macOS
+ // composites the patch window without an ICC conversion, so applying the
+ // profile's inverse would have nothing to cancel against and would correct
+ // once in the wrong direction. The Companion refuses those modes; withdraw
+ // them here so they are not offered in the first place.
+ const cannotReadProfile=(isLinux&&
+  (!meterIccCompanionVersion||meterIccVersionBelow(meterIccCompanionVersion,'1.4.2')))||isMac;
  ['meterCalibrationCompanionCorrectionMode','meterIccCompanionCorrectionMode'].forEach(function(id){
   const select=document.getElementById(id);
   if(!select) return;
@@ -1249,7 +1257,8 @@ function meterIccApplyCompanionCorrectionAvailability(){
    if(unavailable&&select.value===option.value) reselect=true;
   });
   const system=select.querySelector('option[value="system"]');
-  if(system) system.textContent=isLinux?'Compositor profile handling (KWin)':'Windows profile handling';
+  if(system) system.textContent=isMac?'macOS profile handling (ColorSync)':
+   isLinux?'Compositor profile handling (KWin)':'Windows profile handling';
   // A stored selection from a Windows session must not survive onto a Linux
   // Companion as a hidden-but-selected value.
   if(reselect){
@@ -1266,7 +1275,8 @@ function meterIccApplyCompanionCorrectionAvailability(){
 const METER_ICC_GITHUB_RELEASE_ASSETS={
  'windows-x64':'PGeneratorPlus-ICC-Tools-Windows-x64.exe',
  'windows-portable-x64':'PGeneratorPlus-ICC-Tools-Portable-Windows-x64.zip',
- 'linux-x64':'PGeneratorPlus-ICC-Tools-Linux-x64.zip'
+ 'linux-x64':'PGeneratorPlus-ICC-Tools-Linux-x64.zip',
+ 'macos-arm64':'PGeneratorPlus-ICC-Tools-macOS-arm64.zip'
 };
 
 // Which package this visitor most likely wants. A connected Companion is the
@@ -1276,8 +1286,12 @@ const METER_ICC_GITHUB_RELEASE_ASSETS={
 function meterIccPreferredDownloadPlatform(){
  if(meterIccCompanionPlatform==='linux') return 'linux-x64';
  if(meterIccCompanionPlatform==='windows') return 'windows-x64';
+ if(meterIccCompanionPlatform==='macos') return 'macos-arm64';
  const hint=String((navigator.userAgentData&&navigator.userAgentData.platform)||navigator.platform||navigator.userAgent||'');
  if(/win/i.test(hint)) return 'windows-x64';
+ // Order matters: a Mac user agent contains "Mac OS X", and iOS devices report
+ // "like Mac OS X" too, so exclude the ones that cannot run the tools.
+ if(/mac/i.test(hint)&&!/iphone|ipad|ipod/i.test(hint)) return 'macos-arm64';
  if(/linux|x11|cros/i.test(hint)&&!/android/i.test(hint)) return 'linux-x64';
  return '';
 }
@@ -1291,7 +1305,7 @@ function meterIccApplyDownloadRecommendation(){
  // The release page lists every platform, so rather than choosing for the
  // visitor, name the file they want. Runs on every status poll because the
  // answer changes the moment a Companion connects or goes away.
- const labels={'windows-x64':'the Windows installer','windows-portable-x64':'the Windows portable zip','linux-x64':'the KDE/Linux zip'};
+ const labels={'windows-x64':'the Windows installer','windows-portable-x64':'the Windows portable zip','linux-x64':'the KDE/Linux zip','macos-arm64':'the macOS (Apple Silicon) zip'};
  const hint=document.getElementById('meterIccReleaseHint');
  if(hint) hint.textContent=labels[preferred]?('Look for '+labels[preferred]+'.'):'';
 }
