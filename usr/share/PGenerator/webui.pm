@@ -1862,19 +1862,49 @@ sub webui_handle_request (@) {
     system("(sleep 2 && PG_CMD=\"$cmd_b64\" sudo -E /usr/bin/PGenerator_cmd.pl) &");
    }
    elsif($path eq "/api/boot/memory") {
+    # Pi 4 (BiasiLinux): the firmware GPU split (gpu_mem) is the graphics
+    # memory. Pi 5 (Bookworm): the firmware reports a fixed 8M and ignores
+    # gpu_mem; the display/3D buffers live in the kernel CMA pool sized by
+    # the vc4-kms-v3d overlay's cma- parameter, so that is what the card
+    # reads and sets there.
+    my $memory_model=&webui_boot_memory_model();
     if($method eq "GET") {
      my $gpu_mem=&pgenerator_cmd("GET_GPU_MEMORY");
      chomp($gpu_mem);
      $gpu_mem=~s/M$//;
      $gpu_mem||="128";
-     my $json="{\"gpu_mem\":\"$gpu_mem\"}";
+     my $boot=&pgenerator_cmd("GET_BOOT_MEMORY"); chomp($boot);
+     my ($boot_gpu,$boot_cma)=split(/,/,$boot,2);
+     $boot_gpu="" if(!defined $boot_gpu || $boot_gpu!~/^\d+$/);
+     $boot_cma="default" if(!defined $boot_cma || $boot_cma!~/^\d+$/);
+     my ($cma_total,$cma_free)=&webui_cma_pool_mb();
+     my $json="{\"gpu_mem\":\"$gpu_mem\",\"memory_model\":\"$memory_model\""
+      .",\"boot_gpu_mem\":\"$boot_gpu\",\"cma_configured\":\"$boot_cma\""
+      .",\"cma_total_mb\":".(defined $cma_total ? $cma_total : "null")
+      .",\"cma_free_mb\":".(defined $cma_free ? $cma_free : "null")."}";
      my $len=length($json);
      print $client "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: $len\r\n$cors\r\n$json";
     }
     elsif($method eq "POST") {
-     my $gpu_val;
+     my $gpu_val; my $cma_val;
      $gpu_val=$1 if($body=~/"gpu_mem"\s*:\s*"(\d+)"/);
-     if($gpu_val && $gpu_val=~/^(64|128|192|256)$/) {
+     $cma_val=$1 if($body=~/"cma_mb"\s*:\s*"(default|\d+)"/);
+     if($memory_model eq "cma" && defined $cma_val && $cma_val=~/^(default|64|96|128|192|256|320|384|448|512)$/) {
+      my $shown=($cma_val eq "default") ? "the Raspberry Pi OS default (64MB)" : "${cma_val}MB";
+      my $r="{\"status\":\"ok\",\"message\":\"CMA graphics memory set to $shown. Rebooting...\"}";
+      my $len=length($r);
+      print $client "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: $len\r\n$cors\r\n$r";
+      close($client);
+      undef $client;
+      my $cmd_b64=encode_base64("SET_CMA_MEMORY","")." ".encode_base64("$cma_val","");
+      system("(sleep 2 && PG_CMD=\"$cmd_b64\" sudo -E /usr/bin/PGenerator_cmd.pl) &");
+     }
+     elsif($memory_model eq "cma") {
+      my $r='{"status":"error","message":"This Raspberry Pi 5 uses the CMA pool: send cma_mb (default, 64, 96, 128, 192, 256, 320, 384, 448 or 512)"}';
+      my $len=length($r);
+      print $client "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: $len\r\n$cors\r\n$r";
+     }
+     elsif($gpu_val && $gpu_val=~/^(64|128|192|256)$/) {
       my $r="{\"status\":\"ok\",\"message\":\"GPU memory set to ${gpu_val}MB. Rebooting...\"}";
       my $len=length($r);
       print $client "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: $len\r\n$cors\r\n$r";
@@ -1889,9 +1919,6 @@ sub webui_handle_request (@) {
      }
     }
    }
-   ###############################################
-   #           Meter API Endpoints               #
-   ###############################################
    elsif($path eq "/api/meter/status") {
     my $result=&webui_meter_status();
     my $len=length($result);
@@ -10060,6 +10087,11 @@ sub webui_info_json (@) {
  my $gpu_mem=&read_from_file("$info_dir/GET_GPU_MEMORY.info");
  chomp($gpu_mem);
  $gpu_mem=~s/\s//g;
+ if(&webui_boot_memory_model() eq "cma") {
+  # Pi 5: the firmware split is a fixed 8M and not what the renderer uses.
+  my ($cma_total)=&webui_cma_pool_mb();
+  $gpu_mem="CMA ${cma_total}M" if(defined $cma_total);
+ }
  my $hdmi_port_json=&webui_hdmi_port_status();
  return "{\"hostname\":\"$hostname\",\"version\":\"$ver\",\"temperature\":\"$temp\",\"uptime\":\"$uptime\",\"resolution\":\"$resolution\",\"interfaces\":$ip_json,\"wifi\":{\"ssid\":\"$wifi_ssid\",\"freq\":\"$wifi_freq\",\"band\":\"$wifi_band\",\"signal\":\"$wifi_signal\",\"state\":\"$wifi_state\"},\"calibration\":{\"connected\":$cal_conn,\"ip\":\"$cal_ip\",\"software\":\"$cal_sw\"},\"total_ram\":\"$total_ram\",\"gpu_mem\":\"$gpu_mem\",\"hdmi_port\":$hdmi_port_json}";
 }
@@ -11676,6 +11708,28 @@ sub webui_signal_code_policy (@) {
  return $policy;
 }
 
+# Which boot setting is the graphics memory on this board. Pi 5 / CM5
+# (BCM2712) firmware ignores gpu_mem and reports a fixed 8M; the vc4/v3d
+# drivers allocate from the kernel CMA pool sized by the vc4-kms-v3d overlay.
+sub webui_boot_memory_model (@) {
+ my $model=&read_from_file("/proc/device-tree/model");
+ $model="" if(!defined $model);
+ $model=~s/\0//g;
+ return "cma" if($model=~/Raspberry Pi 5|Raspberry Pi Compute Module 5|BCM2712/);
+ return "gpu_mem";
+}
+# (CmaTotal, CmaFree) in MB from /proc/meminfo, undef when unavailable.
+sub webui_cma_pool_mb (@) {
+ my ($total,$free);
+ if(open(my $fh,"<","/proc/meminfo")) {
+  while(my $line=<$fh>) {
+   $total=int($1/1024) if($line=~/^CmaTotal:\s*(\d+)\s*kB/);
+   $free=int($1/1024) if($line=~/^CmaFree:\s*(\d+)\s*kB/);
+  }
+  close($fh);
+ }
+ return ($total,$free);
+}
 sub webui_grey_code_for_stimulus (@) {
  my ($stimulus_pct,$signal_mode,$target_gamma,$signal_range,$opts_hr)=@_;
  my $policy=&webui_signal_code_policy($signal_mode,$signal_range,$opts_hr);

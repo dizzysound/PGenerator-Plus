@@ -1369,7 +1369,9 @@ async function loadInfo(quiet){
  if(info.total_ram) addInfo(g,'RAM',info.total_ram+'MB');
  if(info.gpu_mem) addInfo(g,'GPU Mem',info.gpu_mem);
  // Update GPU Memory card readout
- if(info.gpu_mem){
+ // On a Pi 5 the card shows the CMA pool (loadMemory); the firmware split
+ // in /api/info is a fixed 8M there and must not overwrite that readout.
+ if(info.gpu_mem&&memoryModel!=='cma'){
   const gi=document.getElementById('gpuMemInfo');
   if(gi){gi.innerHTML='';addInfo(gi,'Current',info.gpu_mem);}
  }
@@ -2273,22 +2275,61 @@ function setPowerButtonState(online){
  b.title=effective?'Power off':(_powerOffRequested?'Shutdown requested':'Offline');
 }
 
+// 'gpu_mem' (Pi 4: firmware GPU split) or 'cma' (Pi 5: kernel CMA pool sized
+// by the vc4-kms-v3d overlay; the firmware split there is a fixed, unused 8M).
+let memoryModel='gpu_mem';
 async function loadMemory(){
  const m=await fetchJSON('/api/boot/memory',{_quiet:true});
  if(!m)return;
- setVal('gpu_mem',m.gpu_mem||'128');
+ memoryModel=(m.memory_model==='cma')?'cma':'gpu_mem';
+ const gpuField=document.getElementById('gpuMemField');
+ const cmaField=document.getElementById('cmaMemField');
+ const note=document.getElementById('gpuMemNote');
  const g=document.getElementById('gpuMemInfo');
- if(g){
-  g.innerHTML='';
-  addInfo(g,'Current',m.gpu_mem+'MB');
+ if(memoryModel==='cma'){
+  if(gpuField)gpuField.style.display='none';
+  if(cmaField)cmaField.style.display='';
+  const configured=(m.cma_configured&&m.cma_configured!=='default')?String(m.cma_configured):'default';
+  const sel=document.getElementById('cma_mb');
+  if(sel){
+   if(![...sel.options].some(o=>o.value===configured)){
+    const o=document.createElement('option');o.value=configured;o.textContent=configured+' MB';sel.appendChild(o);
+   }
+   sel.value=configured;
+  }
+  if(g){
+   g.innerHTML='';
+   addInfo(g,'CMA pool',(m.cma_total_mb!=null?m.cma_total_mb+' MB':'unknown')+(m.cma_free_mb!=null?' ('+m.cma_free_mb+' MB free)':''));
+   addInfo(g,'Configured',configured==='default'?'default (64 MB)':configured+' MB');
+   addInfo(g,'Firmware split',(m.gpu_mem||'8')+' MB (not used on Pi 5)');
+  }
+  if(note)note.textContent='Changes require a reboot. The Pi 5 renderer allocates its scanout buffers from this pool; a 4K 10-bit buffer needs about 32 MB, so use 256 MB or more for 4K 10-bit patterns.';
+ }else{
+  if(gpuField)gpuField.style.display='';
+  if(cmaField)cmaField.style.display='none';
+  setVal('gpu_mem',m.gpu_mem||'128');
+  if(g){
+   g.innerHTML='';
+   addInfo(g,'Current',m.gpu_mem+'MB');
+  }
+  if(note)note.textContent='Changes require a reboot. Increase if calibration software reports insufficient GPU memory.';
  }
 }
 
 async function applyMemory(){
- const gpu=getVal('gpu_mem');
- if(!confirm('Set GPU memory to '+gpu+'MB and reboot?'))return;
+ let body,prompt;
+ if(memoryModel==='cma'){
+  const cma=getVal('cma_mb');
+  prompt='Set the CMA graphics memory pool to '+(cma==='default'?'the 64 MB default':cma+' MB')+' and reboot?';
+  body={cma_mb:cma};
+ }else{
+  const gpu=getVal('gpu_mem');
+  prompt='Set GPU memory to '+gpu+'MB and reboot?';
+  body={gpu_mem:gpu};
+ }
+ if(!confirm(prompt))return;
  const r=await fetchJSON('/api/boot/memory',{method:'POST',
-  headers:{'Content-Type':'application/json'},body:JSON.stringify({gpu_mem:gpu})});
+  headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
  if(r&&r.status==='ok') toast(r.message);
  else toast(r&&r.message?r.message:'Failed to apply','err');
 }

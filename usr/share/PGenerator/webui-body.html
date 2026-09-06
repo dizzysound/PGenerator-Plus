@@ -1767,7 +1767,7 @@ __PG_LOGO_DARK__
   <h2><span class="drag-handle">&#9776;</span>GPU Memory</h2>
   <div class="info-grid" id="gpuMemInfo" style="margin-bottom:8px"></div>
   <div class="grid">
-   <div class="field">
+   <div class="field" id="gpuMemField">
     <label>GPU Memory Allocation</label>
     <select id="gpu_mem">
      <option value="64">64 MB</option>
@@ -1776,11 +1776,23 @@ __PG_LOGO_DARK__
      <option value="256">256 MB</option>
     </select>
    </div>
+   <div class="field" id="cmaMemField" style="display:none">
+    <label>Graphics Memory (CMA pool)</label>
+    <select id="cma_mb">
+     <option value="default">64 MB (Raspberry Pi OS default)</option>
+     <option value="128">128 MB</option>
+     <option value="192">192 MB</option>
+     <option value="256">256 MB</option>
+     <option value="320">320 MB</option>
+     <option value="384">384 MB</option>
+     <option value="512">512 MB</option>
+    </select>
+   </div>
   </div>
   <div class="btn-row" style="margin-top:10px">
    <button class="btn btn-sm btn-success" onclick="applyMemory()">Apply &amp; Reboot</button>
   </div>
-  <div style="margin-top:6px;font-size:.7rem;color:var(--text2)">Changes require a reboot. Increase if calibration software reports insufficient GPU memory.</div>
+  <div style="margin-top:6px;font-size:.7rem;color:var(--text2)" id="gpuMemNote">Changes require a reboot. Increase if calibration software reports insufficient GPU memory.</div>
  </div>
 
  <!-- Software Update -->

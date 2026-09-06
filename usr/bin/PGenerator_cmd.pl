@@ -941,21 +941,45 @@ sub set_gpu_memory(@) {
 
 ###############################################
 #         Set CMA Memory function             #
+#  Pi 5 / Bookworm: the VideoCore firmware    #
+#  split (gpu_mem) is ignored; scanout and 3D #
+#  buffers come from the kernel CMA pool that #
+#  the vc4-kms-v3d overlay sizes (cma-NNN).   #
 ###############################################
+# Values the vc4-kms-v3d overlay accepts (MB); "default" drops the parameter
+# (64 MB on Raspberry Pi OS). Kept in a sub: the action dispatch at the top
+# of this file runs before any top-level assignment placed down here.
+sub cma_memory_values(@) {
+ return ("default",64,96,128,192,256,320,384,448,512);
+}
+sub cma_memory_value_ok(@) {
+ my $v=shift; $v="" if(!defined $v);
+ for(&cma_memory_values()) { return 1 if("$_" eq "$v"); }
+ return 0;
+}
+# Rewrite the first vc4-kms-v3d overlay line of a config.txt so its cma-
+# parameter matches $val, keeping every other parameter on that line. The
+# overlay name is anchored so vc4-kms-v3d-pi4 style variants are not touched.
+sub cma_rewrite_boot_config(@) {
+ my ($content,$val)=@_;
+ return $content if(!&cma_memory_value_ok($val));
+ my $param=($val eq "default") ? "" : ",cma-$val";
+ if($content=~/^(dtoverlay=vc4-kms-v3d)((?:,[^\n]*)?)$/m) {
+  my ($name,$params)=($1,$2);
+  my @keep=grep { $_ ne "" && $_ !~ /^cma-/ } split(/,/,$params);
+  my $line=$name.(@keep ? ",".join(",",@keep) : "").$param;
+  $content=~s/^dtoverlay=vc4-kms-v3d(?:,[^\n]*)?$/$line/m;
+ } elsif($param ne "") {
+  $content.="\n" if($content ne "" && $content!~/\n\z/);
+  $content.="dtoverlay=vc4-kms-v3d$param\n";
+ }
+ return $content;
+}
 sub set_cma_memory(@) {
  my $cma_val=$ARGV[1];
- # validation: 128, 256, 384, 512, or default (remove cma param)
- if($cma_val =~/^default$|^128$|^256$|^384$|^512$/) {
+ if(&cma_memory_value_ok($cma_val)) {
   my $content=&read_from_file($bootloader_file);
-  if($cma_val eq "default") {
-   $content=~s/dtoverlay=vc4-kms-v3d,cma-\d+/dtoverlay=vc4-kms-v3d/;
-  } else {
-   if($content=~/dtoverlay=vc4-kms-v3d,cma-\d+/) {
-    $content=~s/dtoverlay=vc4-kms-v3d,cma-\d+/dtoverlay=vc4-kms-v3d,cma-$cma_val/;
-   } elsif($content=~/dtoverlay=vc4-kms-v3d/) {
-    $content=~s/dtoverlay=vc4-kms-v3d/dtoverlay=vc4-kms-v3d,cma-$cma_val/;
-   }
-  }
+  $content=&cma_rewrite_boot_config($content,$cma_val);
   &write_file("$bootloader_file.tmp",$bootloader_file,$content);
   &apply_bootloader();
  }
@@ -976,16 +1000,8 @@ sub set_boot_memory(@) {
   $changed=1;
  }
  # Set CMA overlay parameter
- if($cma_val =~/^default$|^128$|^256$|^384$|^512$/) {
-  if($cma_val eq "default") {
-   $content=~s/dtoverlay=vc4-kms-v3d,cma-\d+/dtoverlay=vc4-kms-v3d/;
-  } else {
-   if($content=~/dtoverlay=vc4-kms-v3d,cma-\d+/) {
-    $content=~s/dtoverlay=vc4-kms-v3d,cma-\d+/dtoverlay=vc4-kms-v3d,cma-$cma_val/;
-   } elsif($content=~/dtoverlay=vc4-kms-v3d/) {
-    $content=~s/dtoverlay=vc4-kms-v3d/dtoverlay=vc4-kms-v3d,cma-$cma_val/;
-   }
-  }
+ if(&cma_memory_value_ok($cma_val)) {
+  $content=&cma_rewrite_boot_config($content,$cma_val);
   $changed=1;
  }
  if($changed) {
