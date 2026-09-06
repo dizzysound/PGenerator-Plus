@@ -578,7 +578,7 @@ shared_rsync_excludes_for_rel() {
  local owned
  local target_owned=("${TARGET_OWNED_RUNTIME_PATHS[@]}" "${PGEN_RELEASE_EXTERNAL_ICC_TOOL_PATHS[@]}")
  if [[ "$TARGET" == "pi5-bookworm-armhf" ]]; then
-  target_owned+=("${PI4_NUMPY_RUNTIME_PATHS[@]}" "${PGEN_RELEASE_PI4_ONLY_SYSTEM_PATHS[@]}")
+  target_owned+=("${PI4_NUMPY_RUNTIME_PATHS[@]}" "${PGEN_RELEASE_PI4_ONLY_SYSTEM_PATHS[@]}" "${PGEN_RELEASE_PI4_ONLY_BINARIES[@]}")
  fi
  for owned in "${target_owned[@]}"; do
   case "$owned" in
