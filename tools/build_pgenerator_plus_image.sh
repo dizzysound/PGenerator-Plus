@@ -824,6 +824,10 @@ reset_runtime_state() {
  # daemon writes into tmp/ at runtime. The init script recreates tmp/ at
  # boot, so an empty dir is the correct fresh state.
  find "$ROOT_MOUNT/var/lib/PGenerator/tmp" -mindepth 1 -exec rm -rf {} + 2>/dev/null || true
+ # LG pairing/auto-reject records and PIN sessions belong to the device the
+ # base image was taken from, never to a fresh image.
+ rm -f "$ROOT_MOUNT/var/lib/PGenerator/lg/clients.json"
+ find "$ROOT_MOUNT/var/lib/PGenerator/lg/pin-sessions" -mindepth 1 -exec rm -rf {} + 2>/dev/null || true
  # Normalize operations.txt to the symlink the init script maintains on a
  # live system (operations.txt -> running/operations.txt). A shipped regular
  # file here -- even 0-byte -- shadows that symlink until the init script's
