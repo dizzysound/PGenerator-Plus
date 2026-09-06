@@ -666,6 +666,20 @@ overlay_tree() {
  fi
 }
 
+# A previous PGenerator+ Pi 5 image used as the base still carries files the
+# Pi 5 target now excludes from staging (the rsync excludes only stop them
+# being copied again). Remove them so the image matches the OTA payload.
+remove_pi5_excluded_binaries() {
+ [[ "$TARGET" == "pi5-bookworm-armhf" ]] || return 0
+ local rel
+ for rel in "${PGEN_RELEASE_PI4_ONLY_BINARIES[@]}"; do
+  if [[ -e "$ROOT_MOUNT/$rel" ]]; then
+   log "Removing Pi 4-only binary left by the base image: $rel"
+   rm -f "$ROOT_MOUNT/$rel"
+  fi
+ done
+}
+
 validate_pi4_legacy_runtime() {
  local max_glibc
 
@@ -1848,6 +1862,7 @@ main() {
   hydrate_pi4_numpy_runtime "$ROOT_MOUNT"
  fi
  validate_pi5_usrmerge_root
+ remove_pi5_excluded_binaries
  stage_argyll_runtime
  validate_pi4_legacy_runtime
  validate_colour_math_runtime
