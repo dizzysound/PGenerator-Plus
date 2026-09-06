@@ -1806,7 +1806,7 @@ fix_permissions() {
 
 validate_release_root() {
  log "Validating release manifest"
- "$MANIFEST_CHECKER" --root "$ROOT_MOUNT"
+ "$MANIFEST_CHECKER" --root "$ROOT_MOUNT" --target "$TARGET"
 }
 
 finalize_image() {

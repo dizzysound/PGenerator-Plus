@@ -503,7 +503,7 @@ build_tarball() {
 
 validate_tarball() {
  log "Validating release manifest"
- "$MANIFEST_CHECKER" --tarball "$OUTPUT_TARBALL"
+ "$MANIFEST_CHECKER" --tarball "$OUTPUT_TARBALL" --target "$TARGET"
  log "Validating split Web UI package"
  perl "$FRAGMENT_CHECKER" "$OUTPUT_TARBALL"
  if [[ "$TARGET" == "pi5-bookworm-armhf" ]] && tar -tzf "$OUTPUT_TARBALL" | grep -Eq '^lib(/|$)'; then
