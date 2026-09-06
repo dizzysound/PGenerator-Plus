@@ -816,6 +816,23 @@ stage_argyll_runtime() {
  log "Staged external Argyll runtime from $ARGYLL_RUNTIME_DIR: ${staged[*]}"
 }
 
+# Rewrite a wpa_supplicant.conf to the daemon's template (ctrl_interface,
+# update_config, country) so no network={...} block ships in an image.
+reset_wifi_credentials() {
+ local conf="$1"
+ local country="US"
+ [[ -f "$conf" ]] || return 0
+ if grep -qE '^country=[A-Z]{2}' "$conf"; then
+  country="$(grep -oE '^country=[A-Z]{2}' "$conf" | head -1 | cut -d= -f2)"
+ fi
+ if grep -qE '^\s*(ssid|psk)=' "$conf"; then
+  log "Removing WiFi network credentials inherited from the base image"
+ fi
+ printf 'ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=pgenerator\nupdate_config=1\ncountry=%s\n' "$country" > "$conf"
+ chown root:root "$conf" 2>/dev/null || true
+ chmod 0600 "$conf"
+}
+
 reset_runtime_state() {
  log "Resetting transient runtime state for a fresh image"
  find "$ROOT_MOUNT/usr/bin" "$ROOT_MOUNT/usr/share/PGenerator" \
@@ -842,6 +859,12 @@ reset_runtime_state() {
  # base image was taken from, never to a fresh image.
  rm -f "$ROOT_MOUNT/var/lib/PGenerator/lg/clients.json"
  find "$ROOT_MOUNT/var/lib/PGenerator/lg/pin-sessions" -mindepth 1 -exec rm -rf {} + 2>/dev/null || true
+ # WiFi credentials: a base taken from a bench device carries its network
+ # block in wpa_supplicant.conf (the 2.8.3 Pi 5 image did, and every image
+ # built from it joined that network on first boot). Keep only the header
+ # lines the daemon itself writes; the country code is preserved.
+ reset_wifi_credentials "$ROOT_MOUNT/etc/wpa_supplicant/wpa_supplicant.conf"
+ find "$ROOT_MOUNT/etc/NetworkManager/system-connections" -mindepth 1 -type f -delete 2>/dev/null || true
  # Normalize operations.txt to the symlink the init script maintains on a
  # live system (operations.txt -> running/operations.txt). A shipped regular
  # file here -- even 0-byte -- shadows that symlink until the init script's
