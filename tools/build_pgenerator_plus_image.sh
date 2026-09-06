@@ -1260,7 +1260,12 @@ install_pi5_runtime_packages() {
 
  for deb in "${debs[@]}"; do
   log "Extracting $(basename "$deb")"
-  dpkg-deb -x "$deb" "$ROOT_MOUNT"
+  # GNU tar (which dpkg-deb -x drives) replaces an existing directory symlink
+  # with a real directory by default, so extracting a package that ships
+  # lib/, bin/ or sbin/ entries straight into a usrmerge root turns /lib,
+  # /bin and /sbin into split directories and the image no longer boots.
+  # --keep-directory-symlink routes those entries through the symlinks.
+  dpkg-deb --fsys-tarfile "$deb" | tar -x --keep-directory-symlink -C "$ROOT_MOUNT"
  done
 
  mapfile -t missing < <(pi5_missing_runtime_paths)
@@ -1853,6 +1858,7 @@ main() {
  configure_pi5_time_sync
  validate_pi5_renderer_binary
  install_pi5_runtime_packages
+ validate_pi5_usrmerge_root
  stage_pi5_blas_alternatives
  validate_pi5_runtime_dependencies
  validate_pi5_numerical_runtime
