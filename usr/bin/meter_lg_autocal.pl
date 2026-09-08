@@ -364,6 +364,16 @@ sub verify_lg_picture_mode_for_autocal {
   return undef;
  }
  if($configured eq "") {
+  # Only adopt a mode that belongs to this run's signal family. An HDR run
+  # started before the HDR signal reached the TV can read back an SDR mode;
+  # adopting it would make the first write fail as "not available in hdr10".
+  # Leaving the mode unset keeps the previous behaviour for that case.
+  my $in_family=$response->{"active_picture_mode_in_signal_family"};
+  if(defined($in_family) && !$in_family) {
+   log_line("LG picture mode check: TV reports $active, which is not a ".lc($config->{"signal_mode"}||"")." picture mode; leaving the configured mode unset");
+   $state->{"picture_mode_check"}="active mode $active is outside the run's signal family" if(ref($state) eq "HASH");
+   return undef;
+  }
   $config->{"picture_mode"}=$active;
   log_line("LG picture mode check: no picture mode configured; calibrating the TV's active mode $active");
   if(ref($state) eq "HASH") {

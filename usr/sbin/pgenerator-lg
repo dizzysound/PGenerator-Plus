@@ -1456,9 +1456,13 @@ sub lg_picture_get_workflow (@) {
   my $active=&lg_current_picture_mode($session,$connect_timeout + 2,"get_active_picture_mode_check");
   if($active ne "") {
    $active_mode_check{"active_picture_mode"}=$active;
+   my $have=&map_picture_mode_label_to_ddc_name($active,$signal_mode);
+   # Lets a caller with NO configured mode decide whether the active mode is
+   # even usable for its signal (an HDR run must not adopt "cinema" read
+   # before the HDR signal reached the TV).
+   $active_mode_check{"active_picture_mode_in_signal_family"}=&json_bool($have ne "") if($signal_mode ne "");
    if($requested_picture_mode ne "") {
     my $want=&map_picture_mode_label_to_ddc_name($requested_picture_mode,$signal_mode);
-    my $have=&map_picture_mode_label_to_ddc_name($active,$signal_mode);
     $active_mode_check{"requested_picture_mode"}=$want ne "" ? $want : $requested_picture_mode;
     $active_mode_check{"picture_mode_matches_active"}=&json_bool(lc($have) eq lc($want)) if($have ne "" && $want ne "");
    }
