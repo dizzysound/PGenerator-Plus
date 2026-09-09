@@ -5537,6 +5537,14 @@ async function meterAutoCalResetDdc(){
  sdrCalmanReset=await meterAutoCalSdrCalmanReset(pictureMode);
  }
  response.picture_mode_reset=pictureModeReset;
+ const pictureModeProbe=pictureModeReset||hdrCalmanReset;
+ if(pictureModeProbe&&Object.prototype.hasOwnProperty.call(pictureModeProbe,'picture_mode_readable')){
+  response.tv_picture_mode=pictureModeProbe.tv_picture_mode||'';
+  response.picture_mode_readable=!!pictureModeProbe.picture_mode_readable;
+  response.tv_picture_mode_matches=!!pictureModeProbe.tv_picture_mode_matches;
+  response.last_written_picture_mode=pictureModeProbe.last_written_picture_mode||'';
+  response.last_written_picture_mode_matches=!!pictureModeProbe.last_written_picture_mode_matches;
+ }
  if(hdrCalmanReset) response.hdr_calman_reset=hdrCalmanReset;
  if(sdrCalmanReset) response.sdr_calman_reset=sdrCalmanReset;
  if(typeof lgDisplayControlInvalidate==='function') lgDisplayControlInvalidate();

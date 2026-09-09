@@ -1910,53 +1910,15 @@ sub lg_picture_reset_workflow (@) {
  my $session=$auth->{"session"};
  my $generation=&lg_generation_info($auth->{"system_info"},$auth->{"software_info"},$auth->{"hello_info"});
  my $profile=&lg_generation_profile($generation);
- # Read the mode the panel is ACTUALLY in, independently of what the caller
- # asked for. $fallback_picture_mode carries the caller's own selection, so a
- # value derived from it proves nothing about the TV -- and Full Auto Cal runs
- # this reset once, immediately before it spends an hour writing a calibration
- # into a single picture mode. That is the moment to notice a disagreement.
- #
- # The picture_get path deliberately does NOT do this: the AutoCal panels poll
- # it every ~30s on the daemon's single WebUI request thread, and it does not
- # need the answer. Empty here means "unknown", never "no mode is set".
- # Full Auto Cal runs this reset once, immediately before it spends an hour
- # writing a calibration into a single picture mode. That is the moment to
- # notice a disagreement, so report the mode the panel is ACTUALLY in --
- # independently of $fallback_picture_mode, which carries the caller's own
- # selection and therefore proves nothing about the TV.
- #
- # Keep the generation gate. It is not a guess: 2841812f measured a live
- # OLED48C1 and found that ssap://settings/getSystemSettings returns no value
- # for pictureMode, that a direct service-bus request is not routed at all,
- # and that even the palm:// bridge which CAN switch the mode is
- # fire-and-forget -- "this generation cannot report pictureMode back on any
- # route". Probing anyway would spend a round trip per reset to be told
- # nothing. 5c19823e is the standing warning against re-deriving these
- # capability gates: eb255177 recomputed one from platform_year <= 2020,
- # quietly made every 2021 set strict, and broke calibration resets for weeks.
- #
- # An empty answer from a set that was expected to reply is still "unknown",
- # never "no mode is set".
- my $picture_mode_readable=$generation->{"picture_mode_read_forbidden"} ? 0 : 1;
- my $tv_picture_mode=$picture_mode_readable
-  ? &lg_current_picture_mode($session,$connect_timeout + 2,"get_picture_mode_for_reset")
-  : "";
- $picture_mode_readable=0 if($tv_picture_mode eq "");
- my $tv_picture_mode_matches=&lg_picture_mode_tokens_agree($fallback_picture_mode,$tv_picture_mode,$signal_mode);
- # A set that cannot report its mode still leaves one trustworthy trace: the
- # mode PGenerator itself last asked it to be in. On a 2021 C1 that is the
- # only evidence available -- the panel answers no route, so without this a
- # wrong-but-present selection is undetectable and calibrates for an hour.
- my $last_written_picture_mode_matches=&lg_picture_mode_tokens_agree($fallback_picture_mode,$last_written_picture_mode,$signal_mode);
- my %picture_mode_probe=(
-  tv_picture_mode => $tv_picture_mode,
-  picture_mode_readable => $picture_mode_readable ? &json_true() : &json_false(),
-  tv_picture_mode_matches => $tv_picture_mode_matches ? &json_true() : &json_false(),
-  last_written_picture_mode => $last_written_picture_mode,
-  last_written_picture_mode_matches => $last_written_picture_mode_matches ? &json_true() : &json_false(),
- );
+ # The panel's own mode, probed independently of $fallback_picture_mode -- the
+ # caller's selection, so a value derived from it proves nothing about the TV
+ # -- plus the last mode PGenerator itself switched the TV to, for sets that
+ # cannot answer. Full Auto Cal guards an hour of calibration writes against
+ # these fields; the probe's rules and their provenance live once, on
+ # lg_picture_mode_probe.
+ my %picture_mode_probe=&lg_picture_mode_probe($session,$generation,$connect_timeout,$fallback_picture_mode,$signal_mode,$last_written_picture_mode);
  my $active_picture_mode=$fallback_picture_mode;
- $active_picture_mode=$tv_picture_mode if($active_picture_mode eq "" && $tv_picture_mode ne "");
+ $active_picture_mode=$picture_mode_probe{"tv_picture_mode"} if($active_picture_mode eq "" && $picture_mode_probe{"tv_picture_mode"} ne "");
  # C9 / pre-2022 DDC-only sets: webOS will not report pictureMode. Prefer the
  # operator-selected mode, then the last saved DDC calibration mode, then the
  # signal-default (cinema / hdrCinema / ...). Without this the Display Card
@@ -4210,7 +4172,8 @@ sub lg_dv_profile_preflight_settings_off (@) {
 }
 
 sub lg_hdr_calman_reset_workflow (@) {
- my ($ip,$client_key,$connect_timeout,$picture_mode,$tv_input)=@_;
+ my ($ip,$client_key,$connect_timeout,$picture_mode,$tv_input,$last_written_picture_mode)=@_;
+ $last_written_picture_mode="" if(!defined($last_written_picture_mode));
  return &json_error("Connect / Pair the LG TV before resetting HDR calibration data",{ ip => $ip }) if($client_key eq "");
  my $auth=&lg_authenticated_session($ip,$client_key,$connect_timeout,$DEFAULT_PAIR_TIMEOUT,0);
  return $auth if(($auth->{"status"}||"") ne "ok");
@@ -4221,6 +4184,11 @@ sub lg_hdr_calman_reset_workflow (@) {
   &websocket_close($session);
   return &json_error("HDR reset requires an active HDR picture mode.",{ ip => $ip, active_picture_mode => $active_picture_mode, calibration_picture_mode => $cal_mode });
  }
+ # HDR10 Full Auto Cal makes no picture-mode reset call, so this workflow is
+ # where the preflight guard's evidence has to come from: same probe, same
+ # rules, as the picture reset (lg_picture_mode_probe). Runs before CAL_START
+ # so nothing touches the calibration bracket.
+ my %picture_mode_probe=&lg_picture_mode_probe($session,$generation,$connect_timeout,$picture_mode,"hdr10",$last_written_picture_mode);
  my @steps=();
  my $cal_payload=&lg_force_pic_mode_payload(&lg_hdr_calman_float_payload());
  my $start=&lg_calibration_request($session,"hdr_calman_reset_cal_start","CAL_START",$cal_payload,1,$cal_mode,$connect_timeout + 4);
@@ -4326,6 +4294,7 @@ sub lg_hdr_calman_reset_workflow (@) {
   client_key => $auth->{"client_key"},
   active_picture_mode => $active_picture_mode,
   calibration_picture_mode => $cal_mode,
+  %picture_mode_probe,
   hdr_calman_reset => &json_true(),
   bt2020_matrix_identity => &json_true(),
   bt2020_3d_lut_unity => &json_true(),
@@ -4347,7 +4316,8 @@ sub lg_hdr_calman_reset_workflow (@) {
 # mode names, see lg_picture_mode_for_calibration) and every message says
 # Dolby Vision / DV instead of HDR.
 sub lg_dv_calman_reset_workflow (@) {
- my ($ip,$client_key,$connect_timeout,$picture_mode,$tv_input)=@_;
+ my ($ip,$client_key,$connect_timeout,$picture_mode,$tv_input,$last_written_picture_mode)=@_;
+ $last_written_picture_mode="" if(!defined($last_written_picture_mode));
  return &json_error("Connect / Pair the LG TV before resetting Dolby Vision calibration data",{ ip => $ip }) if($client_key eq "");
  my $auth=&lg_authenticated_session($ip,$client_key,$connect_timeout,$DEFAULT_PAIR_TIMEOUT,0);
  return $auth if(($auth->{"status"}||"") ne "ok");
@@ -4358,6 +4328,10 @@ sub lg_dv_calman_reset_workflow (@) {
   &websocket_close($session);
   return &json_error("Dolby Vision reset requires an active Dolby Vision picture mode.",{ ip => $ip, active_picture_mode => $active_picture_mode, calibration_picture_mode => $cal_mode });
  }
+ # Dolby Vision Full Auto Cal also skips the picture-mode reset. Probe here,
+ # before CAL_START, so the preflight guard receives the same evidence on
+ # every signal family.
+ my %picture_mode_probe=&lg_picture_mode_probe($session,$generation,$connect_timeout,$picture_mode,"dv",$last_written_picture_mode);
  my @steps=();
  my $cal_payload=&lg_force_pic_mode_payload(&lg_hdr_calman_float_payload());
  # Some DV firmware returns the exact known driver error 20 for CAL_START
@@ -4490,6 +4464,7 @@ sub lg_dv_calman_reset_workflow (@) {
   client_key => $auth->{"client_key"},
   active_picture_mode => $active_picture_mode,
   calibration_picture_mode => $cal_mode,
+  %picture_mode_probe,
   dv_calman_reset => &json_true(),
   bt2020_matrix_identity => &json_true(),
   bt2020_3d_lut_unity => &json_true(),
@@ -7111,6 +7086,61 @@ sub lg_picture_mode_tokens_agree (@) {
  return (lc($want) eq lc($have)) ? 1 : 0;
 }
 
+# Probe the mode the panel is ACTUALLY in, independently of the mode the
+# caller asked for, and compare both against what the caller wants. Returns
+# a list of key => value pairs for merging into the calling workflow's JSON
+# result. Callers are the one-shot calibration gates -- picture_reset, and
+# the HDR/DV Calman resets Full Auto Cal runs on HDR10/DV where no
+# picture-mode reset call is made at all (webOS rejects the SDR-style reset
+# commands on HDR picture modes, so the wizard skips straight to the Calman
+# reset; there the probe is the preflight guard's only source). The polled
+# picture_get path deliberately does NOT do this: the AutoCal panels poll
+# it every ~30s on the daemon's single WebUI request thread and do not need
+# the answer.
+#
+# Empty tv_picture_mode means "unknown", never "no mode is set".
+#
+# Keep the generation gate. It is not a guess: 2841812f measured a live
+# OLED48C1 and found that ssap://settings/getSystemSettings returns no value
+# for pictureMode, that a direct service-bus request is not routed at all,
+# and that even the palm:// bridge which CAN switch the mode is
+# fire-and-forget -- "this generation cannot report pictureMode back on any
+# route". Probing anyway would spend a round trip to be told nothing.
+# 5c19823e is the standing warning against re-deriving these capability
+# gates: eb255177 recomputed one from platform_year <= 2020, quietly made
+# every 2021 set strict, and broke calibration resets for weeks. An empty
+# answer from a set that was expected to reply is still "unknown".
+#
+# A set that cannot report its mode still leaves one trustworthy trace: the
+# mode PGenerator itself last asked it to be in. calibration_picture_mode
+# cannot serve: it only moves on a DDC white-balance write, so it holds the
+# last CALIBRATED mode and is stale exactly when the operator has just
+# switched modes by hand. On a 2021 C1 the last written mode is the only
+# evidence there is -- the panel answers no route, so without it a
+# wrong-but-present selection is undetectable and calibrates for an hour.
+#
+# Comparison goes through the label map (lg_picture_mode_tokens_agree),
+# never raw strings: a Dolby Vision "dolbyVisionCinema" selection reads
+# back as "dolbyHdrCinema", and DV Filmmaker IS the dolbyHdrCinema selector.
+sub lg_picture_mode_probe (@) {
+ my ($session,$generation,$connect_timeout,$wanted_picture_mode,$signal_mode,$last_written_picture_mode)=@_;
+ $wanted_picture_mode="" if(!defined($wanted_picture_mode));
+ $signal_mode="" if(!defined($signal_mode));
+ $last_written_picture_mode="" if(!defined($last_written_picture_mode));
+ my $picture_mode_readable=(ref($generation) eq "HASH" && !$generation->{"picture_mode_read_forbidden"}) ? 1 : 0;
+ my $tv_picture_mode=$picture_mode_readable
+  ? &lg_current_picture_mode($session,$connect_timeout + 2,"get_picture_mode_for_reset")
+  : "";
+ $picture_mode_readable=0 if($tv_picture_mode eq "");
+ return (
+  tv_picture_mode => $tv_picture_mode,
+  picture_mode_readable => $picture_mode_readable ? &json_true() : &json_false(),
+  tv_picture_mode_matches => &lg_picture_mode_tokens_agree($wanted_picture_mode,$tv_picture_mode,$signal_mode) ? &json_true() : &json_false(),
+  last_written_picture_mode => $last_written_picture_mode,
+  last_written_picture_mode_matches => &lg_picture_mode_tokens_agree($wanted_picture_mode,$last_written_picture_mode,$signal_mode) ? &json_true() : &json_false(),
+ );
+}
+
 sub lg_current_picture_mode (@) {
  my ($session,$timeout,$id)=@_;
  $id="get_calibration_picture_mode" if(!defined($id) || $id eq "");
@@ -7824,9 +7854,9 @@ sub main (@) {
    $result=&lg_3d_lut_reset_workflow($ip,$client_key,$connect_timeout,$picture_mode,$upload_command,$get_command,$keep_calibration_mode,$calibration_mode_active,$signal_mode);
   }
 	 } elsif($action eq "hdr_picture_reset" || $action eq "hdr_calman_reset") {
-	  $result=&lg_hdr_calman_reset_workflow($ip,$client_key,$connect_timeout,$picture_mode,$tv_input);
+	  $result=&lg_hdr_calman_reset_workflow($ip,$client_key,$connect_timeout,$picture_mode,$tv_input,$last_written_picture_mode);
 	 } elsif($action eq "dv_calman_reset") {
-	  $result=&lg_dv_calman_reset_workflow($ip,$client_key,$connect_timeout,$picture_mode,$tv_input);
+	  $result=&lg_dv_calman_reset_workflow($ip,$client_key,$connect_timeout,$picture_mode,$tv_input,$last_written_picture_mode);
 	 } elsif($action eq "sdr_calman_reset") {
 	  $result=&lg_sdr_calman_reset_workflow($ip,$client_key,$connect_timeout,$picture_mode,$tv_input);
 	 } elsif($action eq "hdr_tone_map_upload") {
