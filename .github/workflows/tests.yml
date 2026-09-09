@@ -24,5 +24,6 @@ jobs:
         run: |
           perl -c usr/sbin/pgenerator-lg
           perl -c usr/share/PGenerator/lg.pm
+          perl -c usr/share/PGenerator/webui.pm
       - name: Run the test suite
         run: prove -v t/
