@@ -15,7 +15,7 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
-use Test::More tests => 5;
+use Test::More tests => 6;
 
 my $js = "$Bin/../usr/share/PGenerator/webui-lg.js";
 ok(-f $js, 'webui-lg.js is present');
@@ -34,3 +34,5 @@ like($src, qr/r\.virtual_picture_settings\s*\?\s*''\s*:\s*mode/,
 # were `if(<readback>.pictureMode){` with no virtual_picture_settings gate.
 unlike($src, qr/if\(r\.picture_settings\.pictureMode\)\{/,
        'no unguarded lgRememberPictureMode persist from r.picture_settings.pictureMode');
+unlike($src, qr/if\(picture\.pictureMode\)\{/,
+       'no unguarded lgDisplayControlSet persist from picture.pictureMode');

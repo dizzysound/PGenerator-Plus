@@ -5801,18 +5801,21 @@ async function meterAutoCalRunPreflightReset(){
   if(ddcReset&&Object.prototype.hasOwnProperty.call(ddcReset,'picture_mode_readable')){
    const wanted=meterLgPictureModeValue();
    const onTv=String(ddcReset.tv_picture_mode||'');
+   // No target selected: the old fallback guessed the signal default and
+   // calibrated into it. Refuse on readable and non-readable sets alike --
+   // this check used to live only in the non-readable branch, which let a
+   // readable set start an hour with no selection.
+   if(!wanted){
+    throw new Error('No picture mode is selected. Choose the picture mode in the LG Control menu, then start Full Auto Cal again');
+   }
    if(ddcReset.picture_mode_readable){
-    if(wanted&&onTv&&!ddcReset.tv_picture_mode_matches){
+    if(onTv&&!ddcReset.tv_picture_mode_matches){
      throw new Error('Full Auto Cal is set to calibrate "'+lgPictureModeLabel(wanted)+'", but the TV is in "'+lgPictureModeLabel(onTv)+'". Select the mode you want calibrated, or change the TV, then start again');
     }
    } else {
     // The panel will not say what it is in. A 2021 C1 cannot report its mode
     // on any route, so the only remaining evidence is the mode PGenerator
     // itself last switched the TV to.
-    if(!wanted){
-     // The old fallback guessed the signal default here and calibrated into it.
-     throw new Error('No picture mode is selected, and this TV did not report the mode it is in. Choose the picture mode in the LG Control menu, then start Full Auto Cal again');
-    }
     const lastWritten=String(ddcReset.last_written_picture_mode||'');
     if(lastWritten&&!ddcReset.last_written_picture_mode_matches){
      throw new Error('Full Auto Cal is set to calibrate "'+lgPictureModeLabel(wanted)+'", but the last mode PGenerator switched this TV to was "'+lgPictureModeLabel(lastWritten)+'". This TV cannot report its own picture mode, so confirm which one it is in, then start again');

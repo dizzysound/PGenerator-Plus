@@ -1961,6 +1961,7 @@ sub webui_lg_picture_settings_set (@) {
   }
  }
  my $updated_clients=$clients;
+ my $updated_clients_dirty=0;
  $updated_clients=&lg_update_connect_metadata($result,$clients->{"manual_ip"} || $ip) if(($result->{"status"}||"") eq "ok");
  # Remember the mode PGenerator last asked the TV to be in, separately from
  # calibration_picture_mode below. That field only moves on a DDC
@@ -1983,7 +1984,7 @@ sub webui_lg_picture_settings_set (@) {
   if($written ne "") {
    $updated_clients->{"last_written_picture_mode"}=$written;
    $updated_clients->{"last_written_picture_mode_at"}=time();
-   &lg_save_clients($updated_clients);
+   $updated_clients_dirty=1;
   }
  }
 	 if(($result->{"status"}||"") eq "ok" && $ddc_white_balance && ($result->{"ddc_1d_lut"} || exists($result->{"calibration_mode"}))) {
@@ -1995,10 +1996,13 @@ sub webui_lg_picture_settings_set (@) {
 	  } else {
 	   delete($updated_clients->{"calibration_picture_mode"});
 	  }
-	  &lg_save_clients($updated_clients);
+	  $updated_clients_dirty=1;
 	  $result->{"calibration_mode"}=$keep_calibration_mode ? &lg_json_true() : &lg_json_false();
 	  $result->{"calibration_picture_mode"}=$cal_mode if($cal_mode ne "");
 	 }
+ # One write covers both the last-written record and the calibration-mode
+ # fields above; a calibrated picture_set sets both and must not save twice.
+ &lg_save_clients($updated_clients) if($updated_clients_dirty);
  if(&lg_picture_needs_repair($result)) {
    $result->{"message"}="The saved LG client key does not have picture-control permission. Use Display -> Pair With PIN once, enter the TV PIN, then reconnects will use the saved key without another PIN.";
    $result->{"repair_hint"}="Use Display -> Pair With PIN once, then submit the PIN shown on the TV.";
