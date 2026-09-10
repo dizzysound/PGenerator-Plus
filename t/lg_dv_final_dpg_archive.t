@@ -10,7 +10,7 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
-use Test::More tests => 30;
+use Test::More tests => 35;
 
 # The worker guards its main block with `unless(caller())`, so loading it here
 # defines its subs without running a calibration.
@@ -110,3 +110,29 @@ ok(!autocal_applies_low_end_smoothing($dv), 'and archives the committed curve, u
 my $hdr = { full_workflow => 1, signal_mode => 'hdr10' };
 ok(autocal_defers_final_dpg_archive($hdr), 'HDR10 full workflow still defers to the 3D stage');
 ok(autocal_applies_low_end_smoothing($hdr), 'and HDR10 smoothing behaviour is untouched');
+
+# --- the archive-only branch's payload, pinned by source (no JS/TV in CI) ---
+#
+# The predicates above decide WHETHER to archive; these pin WHAT the DV archive
+# branch sends. That branch is the only path a DV curve has into Calibration
+# History, so a regression dropping archive_history, mislabelling the signal
+# mode, or adding a "smoothed" variant would silently reintroduce the bug or
+# misfile the entry. No hardware runs in CI, so assert the source.
+my $worker_src;
+{
+ local $/;
+ open(my $wfh,'<',"$Bin/../usr/bin/meter_lg_autocal.pl") or die "read worker: $!";
+ $worker_src=<$wfh>;
+ close($wfh);
+}
+my ($dv_branch) = $worker_src =~ /if\(!\$apply_smoothing\)\s*\{(.*?)my \(\$smoothed,\$changed\)=/s;
+ok($dv_branch, 'the DV archive-only branch is present');
+$dv_branch //= '';
+like($dv_branch, qr/archive_history=>JSON::PP::true/,
+     'DV branch archives (archive_history true)');
+like($dv_branch, qr/signal_mode=>autocal_hdr20_archive_signal_mode\(\$config\)/,
+     'DV branch labels the entry from the run, not a hardcoded mode');
+like($dv_branch, qr/archive_run_id=>/,
+     'DV branch carries the run id for the history entry');
+unlike($dv_branch, qr/archive_variant/,
+       'DV branch archives the committed curve, not a "smoothed" variant');

@@ -433,8 +433,8 @@ sub autocal_defers_final_dpg_archive {
  my ($config)=@_;
  return 0 if(ref($config) ne "HASH");
  return 0 if(!$config->{"full_workflow"});
- return 0 if(ddc_layout_for_signal_mode($config->{"signal_mode"}) eq "hdr20"
-  && lc($config->{"signal_mode"}||"") eq "dv");
+ # DV always maps to the hdr20 layout, so signal_mode alone decides this.
+ return 0 if(lc($config->{"signal_mode"}||"") eq "dv");
  return 1;
 }
 
@@ -451,8 +451,10 @@ sub autocal_hdr20_archive_signal_mode {
 
 # Whether the post-calibration low-end smoothing should be applied at all.
 #
-# SDR and HDR10 have always received it. Dolby Vision has not, because the
-# block was unreachable for DV, and it should stay that way: measured on an
+# SDR and HDR10 have always received it. Dolby Vision full workflows never did
+# (they defer, and their deferred stage never runs -- see
+# autocal_defers_final_dpg_archive); a DV greyscale-only run did reach the
+# block and smooth, but should not, and now does not. Measured on an
 # LG C1, routing DV through smooth_dpg_low_end moved post-calibration
 # greyscale from mean dE ITP 0.995 to 1.756 and the worst point from 1.92 to
 # 5.37, concentrated between 5% and 35% -- the range the smoothing rewrites
@@ -16051,6 +16053,12 @@ sub lg_autocal_26_run_hdr20_dpg_greyscale {
 			if($aok) {
 				log_line("HDR20 1D DPG greyscale: committed curve archived to Calibration History (low-end smoothing not applied on Dolby Vision)");
 			} else {
+				# Do NOT fail the run -- the calibrated curve is already
+				# committed on the panel. But surface the miss in state so the
+				# completion is not silently reported as fully archived; without
+				# this the DV history gap recurs for the run with only a log line.
+				$state->{"hdr20_1d_dpg_archive_failed"}=JSON::PP::true;
+				$state->{"hdr20_1d_dpg_archive_error"}=$amsg;
 				log_line("HDR20 1D DPG greyscale: Calibration History archive FAILED: ".$amsg);
 			}
 			write_state($state);
