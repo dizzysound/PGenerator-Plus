@@ -15,7 +15,7 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
-use Test::More tests => 6;
+use Test::More tests => 7;
 
 my $js = "$Bin/../usr/share/PGenerator/webui-lg.js";
 ok(-f $js, 'webui-lg.js is present');
@@ -36,3 +36,24 @@ unlike($src, qr/if\(r\.picture_settings\.pictureMode\)\{/,
        'no unguarded lgRememberPictureMode persist from r.picture_settings.pictureMode');
 unlike($src, qr/if\(picture\.pictureMode\)\{/,
        'no unguarded lgDisplayControlSet persist from picture.pictureMode');
+
+# --- every persistence site must be gated, not just the two known old forms ---
+#
+# The regex assertions above pin the specific sites fixed so far, but they would
+# not catch a NEW ungated persistence site (as one at lgResetPictureMode showed).
+# Enumerate every lgRememberPictureMode call and require a gate token within the
+# few lines above it: virtual_picture_settings / picture_mode_readable /
+# picture_mode_verified, or `readback` (the pre-blanked value). The function
+# definition itself is exempt.
+my @lines = split /\n/, $src;
+my @ungated;
+for my $i (0 .. $#lines) {
+ next unless $lines[$i] =~ /lgRememberPictureMode\(/;
+ next if $lines[$i] =~ /function\s+lgRememberPictureMode/;
+ my $lo = $i - 8; $lo = 0 if $lo < 0;
+ my $window = join "\n", @lines[$lo .. $i];
+ push @ungated, ($i + 1)
+   unless $window =~ /virtual_picture_settings|picture_mode_readable|picture_mode_verified|readback/;
+}
+is(scalar(@ungated), 0,
+   'every lgRememberPictureMode persist is gated (ungated lines: '.(join(',',@ungated) || 'none').')');

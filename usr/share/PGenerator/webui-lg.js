@@ -1856,7 +1856,12 @@ async function lgResetPictureMode(){
     msg=r.message||'LG picture mode reset only partially applied. Check picture mode selection and try again.';
    }
    toast(msg,!basicOk&&!bestEffort);
-   if(r.active_picture_mode){
+   // r.active_picture_mode is not always a readback: on a ddc_only set with an
+   // empty dropdown the helper resolves it via the signal-default fallback and
+   // returns that synthesized value. picture_mode_readable (merged from
+   // %picture_mode_probe) is false there, so gate on it -- only persist a mode
+   // the TV could actually report, same rule as the other persistence sites.
+   if(r.active_picture_mode && r.picture_mode_readable){
     lgPictureModeValue=r.active_picture_mode;
     lgPictureModeSignalMode=lgPictureModeEffectiveSignal(r.active_picture_mode);
     lgRememberPictureMode(r.active_picture_mode,lgPictureModeSignalMode);
