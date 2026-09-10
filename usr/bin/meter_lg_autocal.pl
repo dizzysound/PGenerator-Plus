@@ -14809,10 +14809,14 @@ sub lg_autocal_26_run_hdr20_dpg_greyscale {
 		for(my $t=1;$t<=$tries;$t++) {
 			last if(cancelled());
 			$resp=api_json("POST","/api/lg/1d-dpg/upload",{
+				# Default first: in a hash literal the LAST key wins, so a
+				# caller-supplied signal_mode in %{$extra} (the archive label
+				# from autocal_hdr20_archive_signal_mode) must override this,
+				# not be silently overridden by it.
+				signal_mode=>$config->{"signal_mode"}||"hdr10",
 				%{$extra},
 				picture_mode=>$picture_mode,
 				ddc_layout=>"hdr20",
-				signal_mode=>$config->{"signal_mode"}||"hdr10",
 				dpg_data=>$dpg,
 				keep_calibration_mode=>JSON::PP::true,
 				calibration_mode_active=>($cal_active ? JSON::PP::true : JSON::PP::false),

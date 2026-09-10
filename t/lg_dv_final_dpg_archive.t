@@ -10,7 +10,7 @@
 use strict;
 use warnings;
 use FindBin qw($Bin);
-use Test::More tests => 35;
+use Test::More tests => 37;
 
 # The worker guards its main block with `unless(caller())`, so loading it here
 # defines its subs without running a calibration.
@@ -136,3 +136,16 @@ like($dv_branch, qr/archive_run_id=>/,
      'DV branch carries the run id for the history entry');
 unlike($dv_branch, qr/archive_variant/,
        'DV branch archives the committed curve, not a "smoothed" variant');
+
+# The closure merges its own defaults with the caller's %{$extra}. In a Perl
+# hash literal the LAST key wins, so the closure's signal_mode default must
+# sit BEFORE %{$extra} -- otherwise it silently outranks the archive label
+# from autocal_hdr20_archive_signal_mode() and the entry is filed from the
+# closure's copy instead of the run's (the review finding on PR 2).
+my ($hdr20_closure) = $worker_src =~ /my \(\$dpg,\$extra\)=\@_;.*?upload\",\{(.*?)\n\s*\},120\);/s;
+ok($hdr20_closure, 'captured the hdr20 upload closure body');
+my $closure = $hdr20_closure // '';
+my $default_at = index($closure, 'signal_mode=>$config->{"signal_mode"}');
+my $extra_at   = index($closure, '%{$extra},');
+ok($default_at >= 0 && $extra_at >= 0 && $default_at < $extra_at,
+   'closure signal_mode default precedes %{$extra} so the caller label wins');
