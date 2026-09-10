@@ -1,0 +1,17 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  perl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax-check the AutoCal workers
+        run: |
+          perl -c usr/bin/meter_lg_autocal.pl
+          perl -c usr/bin/meter_lg_3d_autocal.pl
+      - name: Run the test suite
+        run: prove -v t/
