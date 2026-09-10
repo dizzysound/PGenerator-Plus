@@ -1055,7 +1055,12 @@ async function lgDisplayControlRefresh(force){
 	   };
 	   lgDisplayControlLoaded=true;
    lgDisplayControlError='';
-   if(r.picture_settings.pictureMode){
+   // Same rule as lgRefreshPictureMode: a ddc_only set answers
+   // virtual_picture_settings, where pictureMode is PGenerator's own resolved
+   // DDC target, not a TV readback. Persisting it via lgRememberPictureMode
+   // poisons the stored per-signal preference and silently replaces the
+   // operator's selection. Only persist a real readback.
+   if(r.picture_settings.pictureMode && !r.virtual_picture_settings){
     const mode=r.picture_settings.pictureMode;
     const signal=lgPictureModeEffectiveSignal(mode);
     lgPictureModeValue=mode;
@@ -1103,7 +1108,9 @@ async function lgDisplayControlCommit(key){
   if(r&&r.status==='ok'){
    const picture=r.picture_settings||{};
    lgDisplayControlValues[key]=(picture[key]!==undefined)?picture[key]:value;
-   if(picture.pictureMode){
+   // Do not persist a synthesized (virtual_picture_settings) mode -- same
+   // contamination path as lgRefreshPictureMode / lgDisplayControlRefresh.
+   if(picture.pictureMode && !r.virtual_picture_settings){
     lgPictureModeValue=picture.pictureMode;
     lgPictureModeSignalMode=lgPictureModeEffectiveSignal(lgPictureModeValue);
     lgRememberPictureMode(lgPictureModeValue,lgPictureModeSignalMode);

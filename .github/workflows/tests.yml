@@ -13,5 +13,9 @@ jobs:
         run: |
           perl -c usr/bin/meter_lg_autocal.pl
           perl -c usr/bin/meter_lg_3d_autocal.pl
+      - name: Syntax-check the changed Perl
+        run: |
+          perl -c usr/sbin/pgenerator-lg
+          perl -c usr/share/PGenerator/lg.pm
       - name: Run the test suite
         run: prove -v t/

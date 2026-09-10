@@ -7081,6 +7081,12 @@ sub lg_picture_mode_tokens_agree (@) {
  $a="" if(!defined($a));
  $b="" if(!defined($b));
  return 1 if($a eq "" || $b eq "");
+ # Fallback to the raw token when the label map does not know it. This can
+ # turn a map-complete selection vs a map-incomplete readback into a false
+ # DISAGREEMENT -- which on a readable set stops an hour of calibration. That
+ # is the fail-safe direction (a spurious stop, never a silent wrong-mode
+ # run), but it means the "unknown is not a disagreement" contract above holds
+ # only when at least one side is empty, not when a side is merely unmapped.
  my $want=&map_picture_mode_label_to_ddc_name($a,$signal_mode) || $a;
  my $have=&map_picture_mode_label_to_ddc_name($b,$signal_mode) || $b;
  return (lc($want) eq lc($have)) ? 1 : 0;

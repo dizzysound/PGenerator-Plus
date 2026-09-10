@@ -289,6 +289,7 @@ sub lg_clear_pairing (@) {
                  "software_version","transport","hello_info","system_info",
                  "software_info","last_seen","calibration_mode",
                  "calibration_picture_mode","disconnected","disconnected_at",
+                 "last_written_picture_mode","last_written_picture_mode_at",
                  "last_error") {
    delete($clients->{$k});
   }
@@ -359,6 +360,14 @@ sub lg_mark_disconnected (@) {
  delete($clients->{"pin_pairing"});
  $clients->{"disconnected"}=&lg_json_true();
  $clients->{"disconnected_at"}=time();
+ # A power-cycle or unplug drops the WebSocket and lands here.
+ # last_written_picture_mode is only trustworthy while the session that wrote
+ # it is still up: after a disconnect the panel may have been switched by
+ # remote or come back in a different mode, and on a set that cannot report
+ # its mode this record is the preflight guard's only evidence. Tie its
+ # lifetime to the connection.
+ delete($clients->{"last_written_picture_mode"});
+ delete($clients->{"last_written_picture_mode_at"});
  return &lg_save_clients($clients);
 }
 
@@ -1960,7 +1969,12 @@ sub webui_lg_picture_settings_set (@) {
  # consulted. On a generation that cannot report its active mode at all (a
  # 2021 C1 cannot, on any route -- see 2841812f), this is the only record of
  # what the panel was actually asked to show, and Full Auto Cal checks its
- # target against it before spending an hour.
+ # target against it before spending an hour. It is exactly that -- what we
+ # last ASKED for: the palm:// switch that sets it is fire-and-forget on this
+ # generation (picture_mode_changed true while picture_mode_verified false),
+ # so it is unverified precisely where it is the only evidence, and it is
+ # cleared on disconnect (lg_mark_disconnected) so it cannot outlive its
+ # session.
  if(($result->{"status"}||"") eq "ok" && ($result->{"picture_mode_changed"} || $result->{"picture_mode_verified"})) {
   my $written=$result->{"active_picture_mode"}
    || ((ref($result->{"applied"}) eq "HASH") ? ($result->{"applied"}{"pictureMode"}||"") : "")
