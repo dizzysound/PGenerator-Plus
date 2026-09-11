@@ -318,87 +318,6 @@ sub verify_lg_tv_power_for_autocal {
  return undef;
 }
 
-# Refuse to calibrate a picture mode the TV is not actually in. The helper's
-# writers apply the mode they are handed (CAL_START and the DDC writes are
-# scoped to it) and only probe the TV when no mode was supplied, so a
-# configured mode that disagreed with the TV -- a stale wizard selection, or
-# the stored calibration_picture_mode standing in for an empty one -- silently
-# switched the TV and an hour-long run landed in the wrong preset with nothing
-# but a trace-log line to show for it. Runs before the first TV write:
-#  * configured mode empty  -> adopt the TV's active mode (the one the operator
-#    actually set) instead of the stored calibration mode;
-#  * configured != active   -> fail now, naming both, before anything is written;
-#  * active unknown (pre-2022 DDC-only sets, cross-family readback, helper
-#    without the check) -> proceed as before and note it in state.
-sub verify_lg_picture_mode_for_autocal {
- my ($config,$state)=@_;
- return undef if(ref($config) ne "HASH");
- my $configured=$config->{"picture_mode"}||"";
- if(ref($state) eq "HASH") {
-  $state->{"phase"}="preparing";
-  $state->{"current_name"}="Verifying LG picture mode";
-  $state->{"message"}=($configured ne "") ? "Checking that the LG TV is in $configured" : "Reading the LG TV's active picture mode";
-  write_state($state);
- }
- my $response=api_json("POST","/api/lg/picture-settings",{
-  keys=>["pictureMode"],
-  picture_mode=>$configured,
-  signal_mode=>lc($config->{"signal_mode"}||""),
-  ignore_calibration_picture_mode=>JSON::PP::true,
-  check_active_picture_mode=>JSON::PP::true,
-  helper_timeout=>45,
- },60);
- if(ref($response) ne "HASH" || ($response->{"status"}||"") ne "ok") {
-  my $why=(ref($response) eq "HASH") ? ($response->{"message"}||"no response") : "no response";
-  log_line("LG picture mode check skipped: $why");
-  $state->{"picture_mode_check"}="skipped: $why" if(ref($state) eq "HASH");
-  return undef;
- }
- my $active=$response->{"active_picture_mode"}||"";
- if($active eq "" && $configured eq "" && !$response->{"virtual_picture_settings"} && ref($response->{"picture_settings"}) eq "HASH") {
-  $active=$response->{"picture_settings"}{"pictureMode"}||"";
- }
- if($active eq "") {
-  log_line("LG picture mode check: TV did not report an active picture mode; using configured mode ".($configured ne "" ? $configured : "(none)"));
-  $state->{"picture_mode_check"}="active mode unavailable" if(ref($state) eq "HASH");
-  return undef;
- }
- if($configured eq "") {
-  # Only adopt a mode that belongs to this run's signal family. An HDR run
-  # started before the HDR signal reached the TV can read back an SDR mode;
-  # adopting it would make the first write fail as "not available in hdr10".
-  # Leaving the mode unset keeps the previous behaviour for that case.
-  my $in_family=$response->{"active_picture_mode_in_signal_family"};
-  if(defined($in_family) && !$in_family) {
-   log_line("LG picture mode check: TV reports $active, which is not a ".lc($config->{"signal_mode"}||"")." picture mode; leaving the configured mode unset");
-   $state->{"picture_mode_check"}="active mode $active is outside the run's signal family" if(ref($state) eq "HASH");
-   return undef;
-  }
-  $config->{"picture_mode"}=$active;
-  log_line("LG picture mode check: no picture mode configured; calibrating the TV's active mode $active");
-  if(ref($state) eq "HASH") {
-   $state->{"picture_mode"}=$active;
-   $state->{"picture_mode_source"}="tv_active";
-   $state->{"picture_mode_check"}="adopted active mode $active";
-  }
-  return undef;
- }
- my $matches=$response->{"picture_mode_matches_active"};
- if(!defined($matches)) {
-  log_line("LG picture mode check: active=$active configured=$configured -- no verdict (different signal family or older helper); proceeding");
-  $state->{"picture_mode_check"}="no verdict: active $active, configured $configured" if(ref($state) eq "HASH");
-  return undef;
- }
- if($matches) {
-  log_line("LG picture mode check: TV is in $active, matching the configured $configured");
-  $state->{"picture_mode_check"}="matched $active" if(ref($state) eq "HASH");
-  return undef;
- }
- $state->{"picture_mode_check"}="mismatch: TV in $active, configured $configured" if(ref($state) eq "HASH");
- log_line("LG picture mode check FAILED: TV is in $active but the run is configured for $configured");
- return "The LG TV is in picture mode '$active' but this run is set up for '$configured'. Select '$active' as the AutoCal picture mode, or switch the TV to '$configured', then start again. Nothing was written to the TV.";
-}
-
 sub shell_quote {
  my ($text)=@_;
  $text="" if(!defined($text));
@@ -12941,56 +12860,6 @@ sub set_picture_values {
 	 return ($picture,$last_message);
 }
 
-# Durable Calibration History snapshot of the curve this run leaves on the
-# panel. Archiving used to ride on the post-cal SMOOTHING upload only, so a
-# run with no smoothing stage -- every Dolby Vision full AutoCal (greyscale ->
-# DV profile), and any run whose smoothing changed nothing -- left its 1D DPG
-# only in the autocal-runs directory, which keeps 10 runs and is wiped by a
-# reflash. Skipped when this worker already archived the smoothed curve
-# (standalone HDR20/SDR26 shadow smoothing) so a run yields one entry per
-# distinct curve, never a duplicate. Best effort: a history failure must not
-# fail a calibration that is already committed on the TV.
-sub archive_final_1d_dpg_history {
- my ($config,$state,$picture_mode,$layout)=@_;
- return 0 unless(ref($state) eq "HASH");
- $layout=lc($layout||"");
- my ($dpg,$signal_mode,$de,$already);
- if($layout eq "sdr26") {
-  $dpg=$state->{"sdr_1d_dpg_data"};
-  $signal_mode="sdr";
-  $de=defined($state->{"sdr_1d_dpg_best_de"}) ? $state->{"sdr_1d_dpg_best_de"} : $state->{"sdr_1d_dpg_final_de"};
-  $already=$state->{"sdr_1d_dpg_low_end_smoothed"} ? 1 : 0;
- } else {
-  $dpg=$state->{"hdr20_1d_dpg_data"};
-  $signal_mode=lc((ref($config) eq "HASH" && $config->{"signal_mode"}) ? $config->{"signal_mode"} : "hdr10");
-  $de=defined($state->{"hdr20_1d_dpg_best_de"}) ? $state->{"hdr20_1d_dpg_best_de"} : $state->{"hdr20_1d_dpg_final_de"};
-  $already=$state->{"hdr20_1d_dpg_low_end_smoothed"} ? 1 : 0;
- }
- return 0 unless(ref($dpg) eq "ARRAY" && @$dpg == 3072);
- if($already) {
-  log_line("1D DPG history: committed curve already archived as the smoothed variant; not duplicating");
-  return 1;
- }
- my $run_id=(ref($config) eq "HASH") ? ($config->{"full_autocal_run_id"}||$config->{"run_id"}||"") : "";
- my $response=api_json("POST","/api/lg/calibration-history/archive",{
-  dpg_data=>$dpg,
-  picture_mode=>$picture_mode||"",
-  signal_mode=>$signal_mode,
-  de=>$de,
-  run_id=>$run_id,
-  display_model=>((ref($config) eq "HASH") ? ($config->{"display_model"}||"") : ""),
- },30);
- my $ok=(ref($response) eq "HASH" && ($response->{"status"}//"") eq "ok") ? 1 : 0;
- $state->{"final_1d_dpg_history_archived"}=$ok ? JSON::PP::true : JSON::PP::false;
- $state->{"final_1d_dpg_history_message"}=(ref($response) eq "HASH" && $response->{"message"})
-  ? $response->{"message"}
-  : ($ok ? "archived" : (defined $response ? "unexpected response" : "endpoint unreachable"));
- log_line("1D DPG history: ".($ok
-  ? "archived committed $signal_mode curve".(($picture_mode||"") ne "" ? " for $picture_mode" : "")
-  : "archive FAILED: ".$state->{"final_1d_dpg_history_message"}));
- return $ok;
-}
-
 sub commit_final_1d_lut {
 	 my ($config,$state,$picture,$arrays,$picture_mode,$ordered,$calibration_mode_active,$white_y)=@_;
 	 $white_y=0 unless(defined $white_y);
@@ -13015,7 +12884,6 @@ sub commit_final_1d_lut {
 	   $state->{"final_1d_lut_skipped"}=JSON::PP::false;
 	   $state->{"calibration_mode"}=JSON::PP::true;
 	   $state->{"sdr_dpg_calibration_mode_held"}=JSON::PP::true;
-	   archive_final_1d_dpg_history($config,$state,$picture_mode,"sdr26");
 	   $state->{"message"}="SDR26 1D DPG greyscale committed; calibration mode HELD for 3D LUT stage (full autocal)";
 	   write_state($state);
 	   return ($picture,undef,1);
@@ -13047,7 +12915,6 @@ sub commit_final_1d_lut {
 	  $state->{"final_1d_lut_upload_verified"}=JSON::PP::true;
 	  $state->{"final_1d_lut_skipped"}=JSON::PP::false;
 	  $state->{"calibration_mode"}=JSON::PP::false;
-	  archive_final_1d_dpg_history($config,$state,$picture_mode,"sdr26");
 	  my $commit_msg=$single_socket_committed
 	   ? "SDR26 1D DPG calibration committed on single socket; calibration mode ended"
 	   : "SDR26 1D DPG calibration committed (single-socket commit FAILED: held-session CAL_END was used as fallback)";
@@ -13072,9 +12939,6 @@ sub commit_final_1d_lut {
 	   $state->{"final_1d_lut_skipped"}=JSON::PP::false;
 	   $state->{"calibration_mode"}=JSON::PP::true;
 	   $state->{"hdr20_dpg_calibration_mode_held"}=JSON::PP::true;
-	   # This is the curve a Dolby Vision full run leaves on the panel (its next
-	   # stage is the DV profile, not a 3D LUT), so it must be archived here.
-	   archive_final_1d_dpg_history($config,$state,$picture_mode,"hdr20");
 	   # Record the measured 100% peak so the full-autocal handoff carries it to
 	   # the 3D LUT stage. The tone-map upload itself is deferred to the 3D stage
 	   # (which holds the same CAL_START), but the WebUI reads this key from the
@@ -13148,7 +13012,6 @@ sub commit_final_1d_lut {
 	  $state->{"final_1d_lut_upload_verified"}=JSON::PP::true;
 	  $state->{"final_1d_lut_skipped"}=JSON::PP::false;
 	  $state->{"calibration_mode"}=JSON::PP::false;
-	  archive_final_1d_dpg_history($config,$state,$picture_mode,"hdr20");
 	  my $commit_msg=$single_socket_committed
 	   ? "HDR20 1D DPG calibration committed on single socket; calibration mode ended"
 	   : "HDR20 1D DPG calibration committed (single-socket commit FAILED: held-session CAL_END was used as fallback)";
@@ -22149,8 +22012,6 @@ eval {
  die "No greyscale steps were supplied" if(!@{$steps});
  my $tv_power_error=verify_lg_tv_power_for_autocal($state);
  die $tv_power_error if(defined($tv_power_error) && $tv_power_error ne "");
- my $picture_mode_error=verify_lg_picture_mode_for_autocal($config,$state);
- die $picture_mode_error if(defined($picture_mode_error) && $picture_mode_error ne "");
  my $level_restore_error=restore_factory_levels_for_autocal($config,$state);
  die $level_restore_error if($level_restore_error);
  my $reset_error=reset_ddc_baseline_for_autocal($config,$state);
