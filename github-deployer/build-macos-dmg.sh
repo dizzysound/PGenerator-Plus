@@ -34,6 +34,10 @@ hfs_tool=${HFSPLUS_TOOL:-$(command -v hfsplus || echo "$HOME/libdmg-hfsplus/buil
 [ -x "$dmg_tool" ] || { echo "libdmg-hfsplus dmg tool is required (DMG_TOOL=...)." >&2; exit 1; }
 
 size_kb=$(du -sk "$build_dir/root" | cut -f1)
+# HFS+ needs generous headroom: the catalog B-tree plus a copy of every
+# file attribute grows past raw file size, and hfsplus addall fails with
+# "error: allocate" once the image runs out of free blocks. 60% + 16 MB.
+size_kb=$(( size_kb * 160 / 100 + 16384 ))
 img_kb=$(( size_kb + size_kb / 5 + 8192 ))
 dd if=/dev/zero of="$build_dir/dmg.hfs" bs=1024 count="$img_kb" status=none
 mkfs.hfsplus -v "$volume" "$build_dir/dmg.hfs" >/dev/null

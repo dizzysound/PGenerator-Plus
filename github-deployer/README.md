@@ -46,7 +46,7 @@ with `./build-macos-package.sh`, and the disk image with
 
 ## GitHub access
 
-The default source is `BigShoots/PGenerator-Plus` on `main`. Public repositories
+The default source is `oldgithubman/PGenerator-Plus` on `main`. Public repositories
 do not require a token. A token can be entered for private repositories or to
 avoid unauthenticated API rate limits. Tokens are used for the current request
 only and are never written to disk or browser storage.
