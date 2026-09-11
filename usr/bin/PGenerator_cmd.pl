@@ -1417,12 +1417,7 @@ sub bt_status (@) {
  my $adapter="";
  my $devices="";
  my $pan_ip="";
- # hciconfig on a missing adapter and ifconfig/ip on a missing interface both
- # complain on stderr ("Device not found"), which pgen_capture's stdout pipe
- # does not swallow. BT_STATUS is polled every 30 s by the WebUI, so with no
- # PAN link up those lines filled the daemon's stderr log by the thousand and
- # buried any real error. Only ask about devices the kernel actually has.
- $hci=&pgen_capture($hciconfig,$hci_interface) if(defined $hciconfig && &pgen_cmd_exists($hciconfig) && -d "/sys/class/bluetooth/$hci_interface");
+ $hci=&pgen_capture($hciconfig,$hci_interface) if(defined $hciconfig && &pgen_cmd_exists($hciconfig));
  if($hci eq "" && defined $bluetoothctl && &pgen_cmd_exists($bluetoothctl)) {
   $hci=&pgen_capture($bluetoothctl,"show");
  }
@@ -1436,13 +1431,14 @@ sub bt_status (@) {
  } elsif(defined $bluetoothctl && &pgen_cmd_exists($bluetoothctl)) {
   $devices=&pgen_capture($bluetoothctl,"devices");
  }
- my @pan_interfaces=("pan0",$bt_interface);
- push @pan_interfaces,"bnep0" if($bt_interface ne "bnep0");
- @pan_interfaces=grep { defined($_) && $_ ne "" && -d "/sys/class/net/$_" } @pan_interfaces;
  if(defined $ifconfig && &pgen_cmd_exists($ifconfig)) {
-  $pan_ip.=&pgen_capture($ifconfig,$_) foreach(@pan_interfaces);
+  $pan_ip=&pgen_capture($ifconfig,"pan0");
+  $pan_ip.=&pgen_capture($ifconfig,$bt_interface);
+  $pan_ip.=&pgen_capture($ifconfig,"bnep0") if($bt_interface ne "bnep0");
  } elsif(defined $ip && &pgen_cmd_exists($ip)) {
-  $pan_ip.=&pgen_capture($ip,"addr","show","dev",$_) foreach(@pan_interfaces);
+  $pan_ip=&pgen_capture($ip,"addr","show","dev","pan0");
+  $pan_ip.=&pgen_capture($ip,"addr","show","dev",$bt_interface);
+  $pan_ip.=&pgen_capture($ip,"addr","show","dev","bnep0") if($bt_interface ne "bnep0");
  }
  my $pan_net="";
  if(-f $pand_default_file) {
