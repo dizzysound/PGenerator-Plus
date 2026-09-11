@@ -416,6 +416,61 @@ sub ddc_layout_for_signal_mode {
  return "sdr26";
 }
 
+# Whether the greyscale worker should leave the post-calibration low-end
+# smoothing (and its Calibration History archive) to a later stage.
+#
+# A full workflow normally defers: the 3D stage rewrites the 1D DPG afterwards
+# -- the HDR tone-map upload carries its own dpg_data payload and the post-cal
+# shadow fix uploads a corrected curve -- so smoothing here would simply be
+# overwritten, and meter_lg_3d_autocal.pl applies it at the true end instead.
+#
+# Dolby Vision has no 3D stage on any LG generation: lg_generation_profile()
+# returns a constant dv_mode => "1d_only". Deferring a DV run therefore hands
+# the work to a stage that never runs, so the curve is neither smoothed nor
+# archived and Calibration History keeps only the transient run-directory
+# entry, which is lost when autocal-runs rotates or the board is reflashed.
+sub autocal_defers_final_dpg_archive {
+ my ($config)=@_;
+ return 0 if(ref($config) ne "HASH");
+ return 0 if(!$config->{"full_workflow"});
+ # DV always maps to the hdr20 layout, so signal_mode alone decides this.
+ return 0 if(lc($config->{"signal_mode"}||"") eq "dv");
+ return 1;
+}
+
+# Calibration History label for a curve archived from the HDR20 greyscale
+# path. That path serves both HDR10 and Dolby Vision, so the run's own mode
+# decides the label -- hardcoding "hdr10" filed DV curves under the wrong
+# signal mode, where the History list would not offer them for a DV restore.
+sub autocal_hdr20_archive_signal_mode {
+ my ($config)=@_;
+ return "hdr10" if(ref($config) ne "HASH");
+ return "dv" if(lc($config->{"signal_mode"}||"") eq "dv");
+ return "hdr10";
+}
+
+# Whether the post-calibration low-end smoothing should be applied at all.
+#
+# SDR and HDR10 have always received it. Dolby Vision full workflows never did
+# (they defer, and their deferred stage never runs -- see
+# autocal_defers_final_dpg_archive); a DV greyscale-only run did reach the
+# block and smooth, but should not, and now does not. Measured on an
+# LG C1, routing DV through smooth_dpg_low_end moved post-calibration
+# greyscale from mean dE ITP 0.995 to 1.756 and the worst point from 1.92 to
+# 5.37, concentrated between 5% and 35% -- the range the smoothing rewrites
+# (idx <= dpg_smooth_blend_index). The error is luminance, not greyscale
+# balance: luminance-compensated dE was unchanged, 0.808 against 0.797. Both
+# runs were Dark Detail on, 37 anchors, 8-bit, same panel and meter.
+#
+# DV still needs its curve archived -- that is the bug this accompanies -- so
+# the caller archives the committed curve instead of a smoothed one.
+sub autocal_applies_low_end_smoothing {
+ my ($config)=@_;
+ return 1 if(ref($config) ne "HASH");
+ return 0 if(lc($config->{"signal_mode"}||"") eq "dv");
+ return 1;
+}
+
 # Dark Detail filler patch values per layout.
 #
 # These are the additional stimuli the reference LG calibration workflow
@@ -14754,10 +14809,14 @@ sub lg_autocal_26_run_hdr20_dpg_greyscale {
 		for(my $t=1;$t<=$tries;$t++) {
 			last if(cancelled());
 			$resp=api_json("POST","/api/lg/1d-dpg/upload",{
+				# Default first: in a hash literal the LAST key wins, so a
+				# caller-supplied signal_mode in %{$extra} (the archive label
+				# from autocal_hdr20_archive_signal_mode) must override this,
+				# not be silently overridden by it.
+				signal_mode=>$config->{"signal_mode"}||"hdr10",
 				%{$extra},
 				picture_mode=>$picture_mode,
 				ddc_layout=>"hdr20",
-				signal_mode=>$config->{"signal_mode"}||"hdr10",
 				dpg_data=>$dpg,
 				keep_calibration_mode=>JSON::PP::true,
 				calibration_mode_active=>($cal_active ? JSON::PP::true : JSON::PP::false),
@@ -15974,10 +16033,41 @@ sub lg_autocal_26_run_hdr20_dpg_greyscale {
 	# Apply the same post-calibration low-end smoothing to standalone HDR20.
 	# Full workflows defer it until after the 3D LUT, tone-map and measured
 	# shadow correction uploads so this remains the final committed 1D DPG.
-	if(!cancelled() && !$upload_failed && !$config->{"full_workflow"}) {
+	# Dolby Vision is the exception -- it has no 3D stage to defer to. See
+	# autocal_defers_final_dpg_archive().
+	if(!cancelled() && !$upload_failed && !autocal_defers_final_dpg_archive($config)) {
 		my $committed=(ref($state) eq "HASH" && ref($state->{"hdr20_1d_dpg_data"}) eq "ARRAY"
 			&& @{$state->{"hdr20_1d_dpg_data"}} == 3072) ? $state->{"hdr20_1d_dpg_data"} : $current_dpg;
-		my ($smoothed,$changed)=smooth_dpg_low_end($committed);
+		my $apply_smoothing=autocal_applies_low_end_smoothing($config);
+		if(!$apply_smoothing) {
+			# Dolby Vision: keep the curve the solver committed and archive it
+			# unchanged. The upload rewrites the DPG already on the panel; it
+			# exists to carry archive_history, which is the only path a curve
+			# has into Calibration History.
+			$state->{"current_name"}="HDR20 1D DPG (archiving)";
+			$state->{"phase"}="writing";
+			$state->{"message"}="Archiving the calibrated curve to Calibration History";
+			write_state($state);
+			my ($aok,$amsg)=$upload_dpg->($committed,{
+				archive_history=>JSON::PP::true,
+				signal_mode=>autocal_hdr20_archive_signal_mode($config),
+				archive_run_id=>($config->{"full_autocal_run_id"}||$config->{"run_id"}||""),
+			});
+			$state->{"hdr20_1d_dpg_low_end_smoothed"}=JSON::PP::false;
+			if($aok) {
+				log_line("HDR20 1D DPG greyscale: committed curve archived to Calibration History (low-end smoothing not applied on Dolby Vision)");
+			} else {
+				# Do NOT fail the run -- the calibrated curve is already
+				# committed on the panel. But surface the miss in state so the
+				# completion is not silently reported as fully archived; without
+				# this the DV history gap recurs for the run with only a log line.
+				$state->{"hdr20_1d_dpg_archive_failed"}=JSON::PP::true;
+				$state->{"hdr20_1d_dpg_archive_error"}=$amsg;
+				log_line("HDR20 1D DPG greyscale: Calibration History archive FAILED: ".$amsg);
+			}
+			write_state($state);
+		}
+		my ($smoothed,$changed)=$apply_smoothing ? smooth_dpg_low_end($committed) : (undef,0);
 		if($changed) {
 			$state->{"current_name"}="HDR20 1D DPG (shadow smoothing)";
 			$state->{"phase"}="writing";
@@ -15988,7 +16078,7 @@ sub lg_autocal_26_run_hdr20_dpg_greyscale {
 			my ($sok,$smsg)=$upload_dpg->($smoothed,{
 				archive_history=>JSON::PP::true,
 				archive_variant=>"smoothed",
-				signal_mode=>"hdr10",
+				signal_mode=>autocal_hdr20_archive_signal_mode($config),
 				archive_run_id=>($config->{"full_autocal_run_id"}||$config->{"run_id"}||""),
 			});
 			if($sok) {
@@ -17936,7 +18026,7 @@ if(ref($state) eq "HASH" && !defined($state->{"sdr_1d_dpg_body_target_logged"}) 
  # its own dpg_data payload, and the post-cal shadow fix uploads a corrected
  # curve -- so smoothing here was simply overwritten. meter_lg_3d_autocal.pl
  # applies it at the true end instead.
- if(!cancelled() && !$upload_failed && !$config->{"full_workflow"}) {
+ if(!cancelled() && !$upload_failed && !autocal_defers_final_dpg_archive($config)) {
   my $committed=(ref($state) eq "HASH" && ref($state->{"sdr_1d_dpg_data"}) eq "ARRAY"
    && @{$state->{"sdr_1d_dpg_data"}} == 3072) ? $state->{"sdr_1d_dpg_data"} : $current_dpg;
   my ($smoothed,$changed)=smooth_dpg_low_end($committed);
