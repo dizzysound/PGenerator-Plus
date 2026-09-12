@@ -6304,6 +6304,32 @@ sub webui_meter_lg_body_with_display_model (@) {
  return $body;
 }
 
+# A Dolby Vision AutoCal always solves against a 2.2 target:
+# lg_autocal_expected_gamma_for_signal_mode_and_ire returns 2.2 for dv,
+# because the panel linearises 2.2 in calibration mode and re-applies its own
+# transfer once calibration mode is off. Only Relative map mode presents that
+# curve. Absolute presents ST 2084, so a DV run started in Absolute solves
+# against a target the panel is not showing.
+#
+# The Web UI switches dv_map_mode to Relative before a DV AutoCal and back to
+# Absolute for the pre/post-cal reports (meterDvAutoCalApplyMapMode in
+# webui-workspace.js). A caller driving this endpoint directly has no such
+# step, and nothing downstream notices: the run completes and commits a curve.
+# Fail closed rather than spend an hour producing one.
+sub webui_lg_autocal_dv_map_mode_error (@) {
+ my ($signal_mode,$map_mode)=@_;
+ $signal_mode=lc(defined($signal_mode) ? $signal_mode : "");
+ $signal_mode=~s/^\s+|\s+$//g;
+ return "" if($signal_mode ne "dv");
+ $map_mode=defined($map_mode) ? $map_mode : "";
+ $map_mode=~s/^\s+|\s+$//g;
+ return "" if($map_mode eq "2");
+ my $seen=($map_mode eq "") ? "unset"
+  : (($map_mode eq "1") ? "Absolute (1)" : "'".$map_mode."'");
+ return "Dolby Vision AutoCal requires DV map mode Relative (dv_map_mode 2); it is currently "
+  .$seen.". Set the DV map mode to Relative before starting the run, as the Web UI does.";
+}
+
 sub webui_meter_lg_autocal_start (@) {
  my ($body)=@_;
  return '{"status":"error","message":"LG Auto Cal payload required"}' if(!defined($body) || $body eq "" || $body!~/^\s*\{/);
@@ -6324,6 +6350,20 @@ sub webui_meter_lg_autocal_start (@) {
   return '{"status":"error","message":"LG Auto Cal is already running"}';
  }
  return '{"status":"error","message":"LG 3D LUT AutoCal is already running"}' if(&webui_meter_lg_3d_autocal_running());
+ # A DV run must calibrate in Relative map mode -- see
+ # webui_lg_autocal_dv_map_mode_error. The Web UI guarantees this; a direct
+ # API caller does not, and the resulting failure is silent.
+ if($body=~/"signal_mode"\s*:\s*"([^"]*)"/) {
+  my $requested_signal_mode=$1;
+  &webui_reload_pgenerator_conf();
+  my $dv_map_error=&webui_lg_autocal_dv_map_mode_error($requested_signal_mode,$pgenerator_conf{"dv_map_mode"});
+  if($dv_map_error ne "") {
+   my $escaped=$dv_map_error;
+   $escaped=~s/\\/\\\\/g;
+   $escaped=~s/"/\\"/g;
+   return '{"status":"error","message":"'.$escaped.'"}';
+  }
+ }
  # Final server-side power gate immediately before any meter/session teardown
  # or worker launch. Block a definite CEC off state, but fail open when CEC is
  # unknown or remains powering-on. Older adapters can keep those advisory
