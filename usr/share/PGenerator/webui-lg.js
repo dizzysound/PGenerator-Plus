@@ -874,7 +874,14 @@ function lgClearPictureModeForSignalChange(){
 
 function lgRefreshPictureModeAfterOutputApply(){
  if(!lgDisplayControlConnected()) return;
- lgClearPictureModeForSignalChange();
+ // An output apply is not always a signal change. Full Auto Cal re-applies
+ // the same signal to switch to its own video transport, and clearing here
+ // drops the operator's selection; lgPopulatePictureModeSelect then refills
+ // it from the stored per-signal preference. On a set that can never verify
+ // a mode switch, that stored value is not what the operator picked, and the
+ // calibration silently targets it. Only a real change of signal family
+ // invalidates the mode list.
+ if(lgSignalModeKey()!==lgPictureModeSignalMode) lgClearPictureModeForSignalChange();
  [250,1500,3500,6500].forEach(delay=>{
   setTimeout(()=>lgRefreshPictureMode(true),delay);
  });
@@ -1048,7 +1055,12 @@ async function lgDisplayControlRefresh(force){
 	   };
 	   lgDisplayControlLoaded=true;
    lgDisplayControlError='';
-   if(r.picture_settings.pictureMode){
+   // Same rule as lgRefreshPictureMode: a ddc_only set answers
+   // virtual_picture_settings, where pictureMode is PGenerator's own resolved
+   // DDC target, not a TV readback. Persisting it via lgRememberPictureMode
+   // poisons the stored per-signal preference and silently replaces the
+   // operator's selection. Only persist a real readback.
+   if(r.picture_settings.pictureMode && !r.virtual_picture_settings){
     const mode=r.picture_settings.pictureMode;
     const signal=lgPictureModeEffectiveSignal(mode);
     lgPictureModeValue=mode;
@@ -1096,7 +1108,9 @@ async function lgDisplayControlCommit(key){
   if(r&&r.status==='ok'){
    const picture=r.picture_settings||{};
    lgDisplayControlValues[key]=(picture[key]!==undefined)?picture[key]:value;
-   if(picture.pictureMode){
+   // Do not persist a synthesized (virtual_picture_settings) mode -- same
+   // contamination path as lgRefreshPictureMode / lgDisplayControlRefresh.
+   if(picture.pictureMode && !r.virtual_picture_settings){
     lgPictureModeValue=picture.pictureMode;
     lgPictureModeSignalMode=lgPictureModeEffectiveSignal(lgPictureModeValue);
     lgRememberPictureMode(lgPictureModeValue,lgPictureModeSignalMode);
@@ -1608,17 +1622,27 @@ async function lgRefreshPictureMode(force){
   if(r&&r.status==='ok'&&r.picture_settings){
    lgUpdateCurrentInput(r);
    const mode=lgPictureModeCanonicalValue(r.picture_settings.pictureMode||'');
+   // A ddc_only set answers virtual_picture_settings, and pictureMode there is
+   // PGenerator's OWN resolved DDC target -- the newest saved calibration, or
+   // failing that the signal default (hdrCinema on HDR10) -- not anything the
+   // TV said. Treating it as a readback persists a guess into the stored
+   // per-signal preference, and lgPopulatePictureModeSelect then hands that
+   // stored value back as the selection the next time the list is rebuilt,
+   // silently replacing the operator's own choice. This is the same rule
+   // lgSetPictureMode already states: never persist a mode the TV could not
+   // read back. Leaving the value untouched keeps the operator's selection.
+   const readback=r.virtual_picture_settings?'':mode;
    // Only accept a TV readback that matches the configured output signal.
    // When HDMI is DV but the TV still reports SDR "cinema" (wrong input,
    // latch, or pre-switch read), pinning that value collapses the card to
    // the SDR list and AutoCal DV reset fails.
-   if(mode && lgPictureModeMatchesSignal(mode,configured)){
-    lgPictureModeValue=mode;
+   if(readback && lgPictureModeMatchesSignal(readback,configured)){
+    lgPictureModeValue=readback;
     lgPictureModeSignalMode=configured;
-    lgRememberPictureMode(mode,configured);
+    lgRememberPictureMode(readback,configured);
     lgDisplayControlInvalidate();
     setTimeout(()=>lgDisplayControlRefresh(true),650);
-   } else if(mode){
+   } else if(readback){
     // Keep DV/HDR options visible; fall back to per-signal stored preference.
     const stored=lgPictureModeCanonicalValue(lgStoredPictureMode(configured));
     lgPictureModeValue=(stored&&lgPictureModeMatchesSignal(stored,configured))?stored:'';
@@ -1832,7 +1856,12 @@ async function lgResetPictureMode(){
     msg=r.message||'LG picture mode reset only partially applied. Check picture mode selection and try again.';
    }
    toast(msg,!basicOk&&!bestEffort);
-   if(r.active_picture_mode){
+   // r.active_picture_mode is not always a readback: on a ddc_only set with an
+   // empty dropdown the helper resolves it via the signal-default fallback and
+   // returns that synthesized value. picture_mode_readable (merged from
+   // %picture_mode_probe) is false there, so gate on it -- only persist a mode
+   // the TV could actually report, same rule as the other persistence sites.
+   if(r.active_picture_mode && r.picture_mode_readable){
     lgPictureModeValue=r.active_picture_mode;
     lgPictureModeSignalMode=lgPictureModeEffectiveSignal(r.active_picture_mode);
     lgRememberPictureMode(r.active_picture_mode,lgPictureModeSignalMode);

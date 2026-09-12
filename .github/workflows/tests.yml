@@ -9,9 +9,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install Perl module dependencies
+        # pgenerator-lg uses IO::Socket::SSL (WebSocket TLS to the TV); it is
+        # not part of core Perl on the runner, so perl -c and the test that
+        # loads the helper both need it. Everything else it uses is core.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libio-socket-ssl-perl
       - name: Syntax-check the AutoCal workers
         run: |
           perl -c usr/bin/meter_lg_autocal.pl
           perl -c usr/bin/meter_lg_3d_autocal.pl
+      - name: Syntax-check the changed Perl
+        run: |
+          perl -c usr/sbin/pgenerator-lg
+          perl -c usr/share/PGenerator/lg.pm
       - name: Run the test suite
         run: prove -v t/
