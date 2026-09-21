@@ -11360,7 +11360,7 @@ sub webui_capabilities_json (@) {
 	 my $dv_transport_color_format=&pg_dv_transport_color_format();
 	 my $dv_transport_max_bpc=&pg_dv_transport_max_bpc();
 	 my $dv_transport_mode=&pg_dv_transport_mode();
-	 my $dv_transport_modes='"standard","lldv"';
+	 my $dv_transport_modes='"standard"';  # LLDV retired -- see pg_dv_transport_mode()
 
 		 return "{\"dc_30bit\":".($dc_30?"true":"false")
 		  .",\"dc_36bit\":".($dc_36?"true":"false")

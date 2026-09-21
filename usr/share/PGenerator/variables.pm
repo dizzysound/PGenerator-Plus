@@ -74,12 +74,21 @@ sub pg_is_pi4_family(@) {
 #             with the LL bit set in the Dolby VSIF. Some displays only
 #             decode this form (and may not even advertise a VSVDB).
 sub pg_dv_transport_mode(@) {
+ # LLDV (Low Latency DoVi, 12-bit YCbCr 4:2:2) is retired here, the choke point
+ # every dv_transport helper below derives from -- and, through
+ # command.pm's normalize_dv_transport_conf(), the renderer's own config. The Pi
+ # renderer has no 12-bit draw path -- resolve.pm keeps the EGL surface at 8bpc --
+ # so LLDV could never deliver its advertised precision, and a 12-bit draw only
+ # risks the unconverted green idle frame documented in pattern.pm. Standard DV
+ # already carries 12-bit source codes through the RPU tunnel. Collapse any
+ # "lldv" -- explicit, persisted, or legacy -- so the DV transport config can
+ # never resolve to LLDV. (This does not touch endpoints that carry a raw
+ # color_format / dv_interface of their own -- the meter-series API and the LG
+ # calibration worker configs -- which a follow-up covers server-side.)
  foreach my $candidate (@_) {
   next if(!defined $candidate || $candidate eq "");
-  return "lldv" if(lc($candidate) eq "lldv");
-  return "standard" if(lc($candidate) eq "standard");
+  return "standard" if(lc($candidate) eq "standard" || lc($candidate) eq "lldv");
  }
- return "lldv" if(lc($pgenerator_conf{"dv_transport"} || "") eq "lldv");
  return "standard";
 }
 
