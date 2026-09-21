@@ -3371,6 +3371,122 @@ sub autocal_dpg_read_failure {
  die "$message\n";
 }
 
+# Meter luminance floor for a DPG solver, clamped to a sane band. SDR and
+# HDR20 share the 0.003-nit i1Display Pro Plus default but keep independent
+# knobs so a panel/meter pairing can be tuned per signal path. The HDR20 key
+# is the one the HDR solver already reads inline; the SDR key is new.
+sub autocal_dpg_meter_floor {
+ my ($config,$prefix)=@_;
+ my $key=($prefix eq "hdr20") ? "lg_autocal_hdr20_dpg_meter_floor" : "lg_autocal_sdr26_dpg_meter_floor";
+ my $floor=(ref($config) eq "HASH" && defined($config->{$key}) && $config->{$key} ne "") ? ($config->{$key}+0) : 0.003;
+ $floor=0.0005 if($floor < 0.0005);
+ $floor=0.05 if($floor > 0.05);
+ return $floor;
+}
+
+# The deepest near-black patches on some panels (notably the 2021 LG OLED C1
+# in SDR) emit light BELOW the colorimeter's usable floor: the meter returns
+# no valid sample after the whole retry budget, luminance error ~ -90%, frozen
+# reads. Historically that unmeasurable read aborted the ENTIRE greyscale job
+# (autocal_dpg_read_failure -> die), discarding a sweep that was otherwise
+# complete. This predicate decides -- conservatively -- when such a failure is
+# an EXPECTED sub-floor condition that should be carried forward (the patch is
+# left uncorrected and interpolated from its neighbors) rather than fatal.
+#
+# ALL guards must agree, so a genuine meter / signal / alignment fault at a
+# patch that SHOULD be measurable still aborts the job:
+#   1. the meter has already produced a valid read THIS pass ($saw_valid_read),
+#      which proves the instrument and signal path are working;
+#   2. the patch is a deepest near-black anchor -- IRE at/below the skip cap
+#      (default 2.5, matching the protected_noise_floor boundary);
+#   3. the patch is physically expected at/below the meter floor -- its target
+#      luminance <= meter_floor * margin. This is true in the dark-white regime
+#      the failure occurs in, and false for a bright calibration where an
+#      unreadable near-black patch is far more likely a real fault;
+#   4. the failure is the "no usable measurement" class, never a cancellation
+#      or an upload/endpoint error.
+sub autocal_nearblack_unmeasurable_skip {
+ my ($config,$prefix,$step,$expected_lum,$reason,$saw_valid_read)=@_;
+ return 0 if(ref($config) ne "HASH" || ref($step) ne "HASH");
+ # Guard 1: the meter is proven this pass.
+ return 0 if(!$saw_valid_read);
+ # Guard 4: only the unmeasurable-sample class; never cancel or upload errors.
+ return 0 if(!defined($reason) || $reason eq "" || $reason =~ /cancel/i);
+ return 0 unless($reason =~ /No usable meter measurement|No usable meter reading|unusable reading|unusable all-zero/i);
+ # The low-shadow sample ladder returns the SAME "No usable meter measurement
+ # ... after N sample attempts; ... meter alignment" text whether the samples
+ # were valid-but-sub-floor (the panel is genuinely below the meter floor -->
+ # skippable) OR the ladder was exhausted by an underlying meter/comms/signal
+ # error (timeout, spotread respawn, pattern rejected, ...). Those two cases
+ # differ ONLY by the ": <underlying error>" the ladder appends after "meter
+ # alignment". A suffix means a real read error drove the failure -- transient
+ # OR hard -- so it must abort, never be carried forward as expected darkness.
+ return 0 if($reason =~ /meter alignment:\s*\S/i);
+ # Guard 2: deepest near-black IRE only.
+ my $ire=defined($step->{"ire"}) ? ($step->{"ire"}+0) : 100;
+ my $ire_key=($prefix eq "hdr20") ? "lg_autocal_hdr20_dpg_nearblack_skip_max_ire" : "lg_autocal_sdr26_dpg_nearblack_skip_max_ire";
+ my $max_ire=(defined($config->{$ire_key}) && $config->{$ire_key} ne "") ? ($config->{$ire_key}+0) : 2.5;
+ $max_ire=0 if($max_ire < 0);
+ $max_ire=10 if($max_ire > 10);
+ return 0 if($ire <= 0 || $ire > $max_ire);
+ # Guard 3: physically expected at/below the meter floor.
+ return 0 if(!defined($expected_lum) || $expected_lum < 0);
+ my $floor=autocal_dpg_meter_floor($config,$prefix);
+ my $margin_key=($prefix eq "hdr20") ? "lg_autocal_hdr20_dpg_nearblack_skip_floor_margin" : "lg_autocal_sdr26_dpg_nearblack_skip_floor_margin";
+ my $margin=(defined($config->{$margin_key}) && $config->{$margin_key} ne "") ? ($config->{$margin_key}+0) : 10.0;
+ $margin=1.0 if($margin < 1.0);
+ $margin=1000.0 if($margin > 1000.0);
+ return 0 if($expected_lum > $floor*$margin);
+ return 1;
+}
+
+# Skip sentinel test. autocal_dpg_read_failure_or_skip throws a HASH ref (not a
+# string) when it carries a near-black patch forward, so the per-anchor eval in
+# each solver can tell a controlled skip apart from a real fatal read failure
+# (a plain "...\n" string). Any other die re-propagates unchanged.
+sub autocal_nearblack_skip_marker {
+ my ($why)=@_;
+ return (ref($why) eq "HASH" && $why->{"__autocal_nearblack_skip__"}) ? 1 : 0;
+}
+
+# The single decision point at every DPG read-failure site. Either carry the
+# patch forward (deepest near-black, expected sub-floor, meter proven) or abort
+# the whole job exactly as before. On skip it records the patch in state and
+# throws the skip sentinel; otherwise it defers to autocal_dpg_read_failure,
+# whose fatal contract (phase=error, uploaded=false, read_failed) is unchanged.
+sub autocal_dpg_read_failure_or_skip {
+ my ($state,$config,$prefix,$step,$idx,$label,$expected_lum,$reason,$saw_valid_read)=@_;
+ if(autocal_nearblack_unmeasurable_skip($config,$prefix,$step,$expected_lum,$reason,$saw_valid_read)) {
+  my $ire=(ref($step) eq "HASH" && defined($step->{"ire"})) ? ($step->{"ire"}+0) : undef;
+  my $floor=autocal_dpg_meter_floor($config,$prefix);
+  my $label_disp=defined($label) ? $label : "patch";
+  if(ref($state) eq "HASH") {
+   $state->{"${prefix}_1d_dpg_skipped_anchors"}=[] if(ref($state->{"${prefix}_1d_dpg_skipped_anchors"}) ne "ARRAY");
+   push @{$state->{"${prefix}_1d_dpg_skipped_anchors"}},{
+    label=>$label_disp,
+    ire=>$ire,
+    idx=>$idx,
+    expected_luminance=>(defined($expected_lum)?$expected_lum+0:undef),
+    meter_floor=>$floor,
+    reason=>$reason,
+   };
+  }
+  # AGENTS.md log vocabulary: the patch was requested and displayed, but the
+  # meter measured no usable sample, so the true panel output here is UNKNOWN
+  # (below the meter floor). The entry is left uncorrected and carried forward.
+  log_line(sprintf(
+   "%s 1D DPG greyscale: %s unmeasurable (expected target %.5f nits at/below meter floor %.5f; meter verified on an earlier patch this pass); leaving patch uncorrected (carry-forward from neighbors), continuing sweep -- measured status: unknown; reason: %s",
+   ($prefix eq "hdr20" ? "HDR20" : "SDR26"),
+   $label_disp,
+   (defined($expected_lum)?$expected_lum+0:0),
+   $floor,
+   ($reason//"no usable meter measurement")));
+  my $marker={ "__autocal_nearblack_skip__"=>1, idx=>$idx, label=>$label_disp, ire=>$ire };
+  die $marker;
+ }
+ autocal_dpg_read_failure($state,$prefix,$label,$reason);
+}
+
 sub committed_polish_far_from_target {
  my ($de,$target_delta)=@_;
  return 0 if(!defined($de));
@@ -14683,7 +14799,7 @@ sub lg_autocal_26_run_hdr20_dpg_greyscale {
 	return "lg_autocal_26_run_hdr20_dpg_greyscale: missing state" unless(ref($state) eq "HASH");
 	return "lg_autocal_26_run_hdr20_dpg_greyscale: missing target chromaticity" unless(defined($target_x) && defined($target_y) && $target_y+0 > 0);
 
-	# Give mid-body anchors enough passes to settle after neighbouring spline
+	# Give mid-body anchors enough passes to settle after neighboring spline
 	# updates. The loop still exits immediately when the selected dE target is
 	# reached, so already-converged patches do not pay the full budget.
 	my $max_inner=defined($config->{"lg_autocal_hdr20_dpg_inner_iters"}) ? int($config->{"lg_autocal_hdr20_dpg_inner_iters"}) : 8;
@@ -15168,6 +15284,19 @@ sub lg_autocal_26_run_hdr20_dpg_greyscale {
 		#     log-log slope that estimates the local gamma.
 		my $_anchor_signal_mode=ref($config) eq "HASH" ? ($config->{"signal_mode"} || "sdr") : "sdr";
 		my $_anchor_ire=(defined($rs->{"ire"}) ? ($rs->{"ire"}+0) : (defined($rs->{"stimulus"}) ? ($rs->{"stimulus"}+0) : 50.0));
+		# Route every read failure in this anchor through the near-black skip
+		# gate. HDR20 already probes sub-floor anchors up, so a read failure here
+		# is rarer than on SDR, but the deepest near-black patch can still be
+		# unreadable; carry it forward (skip sentinel) only when the meter is
+		# proven, the IRE is deepest near-black, and the anchor target is at/below
+		# the meter floor. The expected target luminance is the same 2.2-curve
+		# value the probe-up and per-iter target use for this anchor.
+		my $_hdr_read_failure=sub {
+			my ($reason)=@_;
+			my $_expected=target_luminance_for_step($white_ref,$rs,"2.2","hdr10",undef);
+			my $_saw=(ref($state) eq "HASH" && $state->{"hdr20_1d_dpg_saw_valid_read"}) ? 1 : 0;
+			autocal_dpg_read_failure_or_skip($state,$config,"hdr20",$rs,$idx,$label,$_expected,$reason,$_saw);
+		};
 		my $gamma_effective=lg_autocal_expected_gamma_for_signal_mode_and_ire($_anchor_signal_mode,$_anchor_ire);
 		$gamma_effective=1.5 if($gamma_effective+0 < 1.5);
 		$gamma_effective=3.0 if($gamma_effective+0 > 3.0);
@@ -15270,7 +15399,7 @@ sub lg_autocal_26_run_hdr20_dpg_greyscale {
 		# floor, then run the normal loop from that resolvable point.
 		{
 			my ($probe_rd,$probe_err)=read_step($config,$rs,$state);
-			autocal_dpg_read_failure($state,"hdr20",$label,$probe_err) if($probe_err || ref($probe_rd) ne "HASH");
+			$_hdr_read_failure->($probe_err) if($probe_err || ref($probe_rd) ne "HASH");
 			# Log the INITIAL probe read separately from the post-probe-up read
 			# so an operator can tell whether the read itself was inaccurate (a
 			# settling / pattern-insertion / DPG-modulation race) or whether the
@@ -15279,6 +15408,8 @@ sub lg_autocal_26_run_hdr20_dpg_greyscale {
 			# cases the 100% (recal) and 35% anchors were hitting in 2026-06.
 			if(!$probe_err && ref($probe_rd) eq "HASH") {
 				log_line("HDR20 1D DPG greyscale: ".$label." probe-read initial measured_Y=".sprintf("%.5f",defined(luminance($probe_rd))?(luminance($probe_rd)//0):0));
+				# A valid read proves the meter this pass (gates the near-black skip).
+				$state->{"hdr20_1d_dpg_saw_valid_read"}=1 if(ref($state) eq "HASH");
 			}
 			# The probe-up should stop when the measured luminance reaches this
 			# anchor's TARGET luminance (not just the meter floor). Using the
@@ -15327,7 +15458,7 @@ sub lg_autocal_26_run_hdr20_dpg_greyscale {
 					my ($puk,$pmsg)=$upload_dpg->($current_dpg);
 					return (undef,undef) if(!$puk);
 					my ($rd,$err)=read_step($config,$rs,$state);
-					autocal_dpg_read_failure($state,"hdr20",$label,$err) if($err || ref($rd) ne "HASH");
+					$_hdr_read_failure->($err) if($err || ref($rd) ne "HASH");
 					my $y=luminance($rd);
 					return ($rd,(defined($y)?$y+0:undef));
 				};
@@ -15398,9 +15529,11 @@ sub lg_autocal_26_run_hdr20_dpg_greyscale {
 			write_state($state);
 			my ($reading,$err)=read_step($config,$rs,$state);
 			if($err || ref($reading) ne "HASH") {
-				autocal_dpg_read_failure($state,"hdr20",$label,$err);
+				$_hdr_read_failure->($err);
 			}
 			$last_reading=$reading;
+			# A valid read proves the meter this pass (gates the near-black skip).
+			$state->{"hdr20_1d_dpg_saw_valid_read"}=1 if(ref($state) eq "HASH");
 			# Target luminance per anchor on the 2.2 curve vs the peak white_ref,
 			# the SAME way for every anchor including 100% (where the target is
 			# white_ref, i.e. target_Yn=1.0). Luminance is reached purely by RGB
@@ -15561,7 +15694,7 @@ sub lg_autocal_26_run_hdr20_dpg_greyscale {
 						my $_vd=undef;
 						if($bok && !cancelled()) {
 							my ($arr,$are)=read_step($config,$rs,$state);
-							autocal_dpg_read_failure($state,"hdr20",$label,$are) if($are || ref($arr) ne "HASH");
+							$_hdr_read_failure->($are) if($are || ref($arr) ne "HASH");
 							if(!$are && ref($arr) eq "HASH") {
 								$last_reading=$arr;
 								my $_tl=luminance($arr);
@@ -15725,7 +15858,7 @@ sub lg_autocal_26_run_hdr20_dpg_greyscale {
 					my ($auk,$aumsg)=$upload_dpg->($current_dpg);
 					if($auk) {
 						my ($arr,$are)=read_step($config,$rs,$state);
-						autocal_dpg_read_failure($state,"hdr20",$label,$are) if($are || ref($arr) ne "HASH");
+						$_hdr_read_failure->($are) if($are || ref($arr) ne "HASH");
 						if(!$are && ref($arr) eq "HASH") {
 							$reading=$arr;
 							$last_reading=$arr;
@@ -15848,7 +15981,7 @@ sub lg_autocal_26_run_hdr20_dpg_greyscale {
 			  my $_vd=undef;
 			  if($bok && !cancelled()) {
 			   my ($arr,$are)=read_step($config,$rs,$state);
-			   autocal_dpg_read_failure($state,"hdr20",$label,$are) if($are || ref($arr) ne "HASH");
+			   $_hdr_read_failure->($are) if($are || ref($arr) ne "HASH");
 			   if(!$are && ref($arr) eq "HASH") {
 			    $last_reading=$arr;
 			    my $_tl=luminance($arr);
@@ -16133,7 +16266,27 @@ sub lg_autocal_26_run_hdr20_dpg_greyscale {
 		# budget. All ranges still exit as soon as they meet the dE target.
 		my $step_ire_loop=(defined($rs->{"ire"}) ? ($rs->{"ire"}+0) : (defined($rs->{"stimulus"}) ? ($rs->{"stimulus"}+0) : undef));
 		my $step_budget=$_recal ? $max_inner_white : ((defined($step_ire_loop) && $step_ire_loop+0 <= $very_low_ire_threshold) ? $max_inner_very_low : ((defined($step_ire_loop) && $step_ire_loop+0 <= $low_ire_threshold) ? $max_inner_low : ((defined($step_ire_loop) && $step_ire_loop+0 >= $high_ire_threshold) ? $high_ire_iters : $max_inner)));
-		my ($conv,$last)=$calibrate_anchor->($rs,$target,$idx,$label,$step_num,$step_budget,$_recal);
+		my ($conv,$last);
+		# Snapshot the curve BEFORE the anchor runs so a partial correction from
+		# an early barely-valid iteration is not baked in when a later iteration
+		# goes sub-floor and skips (see the SDR path for the full rationale).
+		my $_pre_anchor_dpg=[@{$current_dpg}];
+		# A deepest near-black anchor that reads sub-floor throws the skip
+		# sentinel from inside calibrate_anchor. Catch it here, restore the
+		# pre-anchor curve so the patch really is left uncorrected (neighbors
+		# interpolate through this idx), re-upload so the panel matches for later
+		# anchors, and continue. Any other die is a real fatal read failure and
+		# re-propagates unchanged, aborting the job as before.
+		my $_anchor_ok=eval { ($conv,$last)=$calibrate_anchor->($rs,$target,$idx,$label,$step_num,$step_budget,$_recal); 1; };
+		if(!$_anchor_ok) {
+			my $_e=$@;
+			die $_e if(!autocal_nearblack_skip_marker($_e));
+			@{$current_dpg}=@{$_pre_anchor_dpg};
+			$state->{"hdr20_1d_dpg_data"}=$current_dpg if(ref($state) eq "HASH");
+			my ($_ru_ok,$_ru_msg)=$upload_dpg->($current_dpg);
+			log_line("HDR20 1D DPG greyscale: carried ".($_e->{"label"}||$label)." forward (uncorrected, pre-anchor curve restored".($_ru_ok?"":"; re-upload failed: ".($_ru_msg//"unknown"))."); sweep continues") if(ref($_e) eq "HASH");
+			next;
+		}
 		push @done,{idx=>$idx,r_gain=>1.0,g_gain=>1.0,b_gain=>1.0};
 		# On the 100% recal, refine the peak reference from the re-measured peak.
 		if($_recal && ref($last) eq "HASH") {
@@ -16265,9 +16418,12 @@ sub lg_autocal_26_run_hdr20_dpg_greyscale {
 	# (end_calibration_mode) before the post-cal series read.
 	$state->{"hdr20_dpg_calibration_mode_held"}=($cal_active ? JSON::PP::true : JSON::PP::false);
 	$state->{"calibration_mode"}=$cal_active ? JSON::PP::true : JSON::PP::false;
-	$state->{"message"}=sprintf("HDR20 1D DPG greyscale complete: %d inner iters across %d anchors, final max dE=%.3f, target<=%.2f, exit=%s",$total_inner_iters,scalar(@done),$max_de_overall_committed,$target_de,$exit_reason);
+	# Carried-forward near-black anchors belong in an honest completion summary.
+	my $_hdr_skipped=(ref($state->{"hdr20_1d_dpg_skipped_anchors"}) eq "ARRAY") ? scalar(@{$state->{"hdr20_1d_dpg_skipped_anchors"}}) : 0;
+	my $_hdr_skip_note=$_hdr_skipped ? sprintf(", %d near-black patch%s left uncorrected (below meter floor)",$_hdr_skipped,($_hdr_skipped==1?"":"es")) : "";
+	$state->{"message"}=sprintf("HDR20 1D DPG greyscale complete: %d inner iters across %d anchors, final max dE=%.3f, target<=%.2f, exit=%s%s",$total_inner_iters,scalar(@done),$max_de_overall_committed,$target_de,$exit_reason,$_hdr_skip_note);
 	write_state($state);
-	log_line("HDR20 1D DPG greyscale: ".$total_inner_iters." inner iters across ".scalar(@done)." anchors, final max dE=".sprintf("%.3f",$max_de_overall_committed)." (committed; trajectory=".sprintf("%.3f",$max_de_overall)."), target=".$target_de.", exit=".$exit_reason.", cal_held=".$cal_active);
+	log_line("HDR20 1D DPG greyscale: ".$total_inner_iters." inner iters across ".scalar(@done)." anchors, final max dE=".sprintf("%.3f",$max_de_overall_committed)." (committed; trajectory=".sprintf("%.3f",$max_de_overall)."), target=".$target_de.", exit=".$exit_reason.", cal_held=".$cal_active.$_hdr_skip_note);
 	my $terminal_error=autocal_dpg_terminal_error(
 		"HDR20 1D DPG",
 		$upload_failed,
@@ -16725,6 +16881,21 @@ sub lg_autocal_26_run_sdr_1d_dpg_greyscale_inner {
   return ($ok,$msg);
  };
 
+ # Deepest near-black patches (e.g. sdr26_2.3% on a C1) can emit sub-floor
+ # light the meter cannot read. Route every read failure in this anchor
+ # through the near-black skip gate: it carries the patch forward (throwing
+ # the skip sentinel the outer loop catches) only when the meter is proven,
+ # the IRE is deepest near-black, and the target is at/below the meter floor;
+ # otherwise it aborts exactly as before. The expected target luminance is the
+ # same value the solver would compute for this anchor's dE below.
+ my $_sdr_read_failure=sub {
+  my ($reason)=@_;
+  my $_tg=defined($config->{"target_gamma"}) ? $config->{"target_gamma"} : "bt1886";
+  my $_expected=lg_autocal_26_sdr26_dpg_compute_target($white_ref,$rs,$black_y,$_tg);
+  my $_saw=(ref($state) eq "HASH" && $state->{"sdr_1d_dpg_saw_valid_read"}) ? 1 : 0;
+  autocal_dpg_read_failure_or_skip($state,$config,"sdr",$rs,$idx,$label,$_expected,$reason,$_saw);
+ };
+
  for(my $i=1;$i<=$budget;$i++) {
   last if(cancelled() || $upload_failed);
   $total_inner_iters++;
@@ -16735,9 +16906,12 @@ sub lg_autocal_26_run_sdr_1d_dpg_greyscale_inner {
   write_state($state);
   my ($reading,$err)=read_step($config,$rs,$state);
   if($err || ref($reading) ne "HASH") {
-   autocal_dpg_read_failure($state,"sdr",$label,$err);
+   $_sdr_read_failure->($err);
   }
   $last_reading=$reading;
+  # A valid read anywhere in the sweep proves the meter and signal path work;
+  # the near-black skip gate requires this before it will carry a patch forward.
+  $state->{"sdr_1d_dpg_saw_valid_read"}=1 if(ref($state) eq "HASH");
   # Peak is chroma-only (Limited 109 legal / Full 100): targets OWN measured Y
   # so dE has zero luminance component -- only pull RGB into balance. Measured
   # Y becomes $white_ref for body anchors' gamma target-Y curve. Limited
@@ -17032,7 +17206,7 @@ sub lg_autocal_26_run_sdr_1d_dpg_greyscale_inner {
     my ($auk,$aumsg)=$upload_dpg->($current_dpg_ref);
     if($auk) {
      my ($arr,$are)=read_step($config,$rs,$state);
-     autocal_dpg_read_failure($state,"sdr",$label,$are) if($are || ref($arr) ne "HASH");
+     $_sdr_read_failure->($are) if($are || ref($arr) ne "HASH");
      if(!$are && ref($arr) eq "HASH") {
       $reading=$arr;
       $last_reading=$arr;
@@ -18128,9 +18302,34 @@ if(ref($state) eq "HASH" && !defined($state->{"sdr_1d_dpg_body_target_logged"}) 
     $state->{"sdr_1d_dpg_body_target_logged"}=JSON::PP::true;
     write_state($state);
    }
-  my ($conv,$last,$final_dpg,$inner_iters,$max_de_anchor,$cal_active_inner,$inner_upload_failed)=lg_autocal_26_run_sdr_1d_dpg_greyscale_inner(
-   $config,$state,$rs,$idx,$label,$budget,$white_ref,$target_x,$target_y,$picture_mode,\@{$current_dpg},\@done,$cal_active
-  );
+  my ($conv,$last,$final_dpg,$inner_iters,$max_de_anchor,$cal_active_inner,$inner_upload_failed);
+  # Snapshot the curve BEFORE the anchor runs. The inner may upload a partial,
+  # non-converged correction on an early iteration (a barely-valid read at the
+  # floor) and only then go fully sub-floor; carrying that partial move forward
+  # would contradict "left uncorrected" and, for the lowest SDR body index,
+  # bake a single noisy near-floor sample into the committed curve permanently.
+  my @_pre_anchor_dpg=@{$current_dpg};
+  # A deepest near-black anchor that reads sub-floor throws the skip sentinel
+  # from inside the inner sub. Catch it here, restore the pre-anchor curve so
+  # the patch really is left uncorrected (neighboring anchors interpolate
+  # through this idx), re-upload so the panel matches for later anchors, and
+  # continue. Any other die is a real fatal read failure and re-propagates
+  # unchanged, aborting the job as before.
+  my $_inner_ok=eval {
+   ($conv,$last,$final_dpg,$inner_iters,$max_de_anchor,$cal_active_inner,$inner_upload_failed)=lg_autocal_26_run_sdr_1d_dpg_greyscale_inner(
+    $config,$state,$rs,$idx,$label,$budget,$white_ref,$target_x,$target_y,$picture_mode,\@{$current_dpg},\@done,$cal_active
+   );
+   1;
+  };
+  if(!$_inner_ok) {
+   my $_e=$@;
+   die $_e if(!autocal_nearblack_skip_marker($_e));
+   @{$current_dpg}=@_pre_anchor_dpg;
+   $state->{"sdr_1d_dpg_data"}=$current_dpg if(ref($state) eq "HASH");
+   my ($_ru_ok,$_ru_msg)=$upload_dpg->(\@{$current_dpg});
+   log_line("SDR26 1D DPG greyscale: carried ".($_e->{"label"}||$label)." forward (uncorrected, pre-anchor curve restored".($_ru_ok?"":"; re-upload failed: ".($_ru_msg//"unknown"))."); sweep continues") if(ref($_e) eq "HASH");
+   next;
+  }
   $total_inner_iters+=$inner_iters;
   $max_de_overall=$max_de_anchor if($max_de_anchor+0 > $max_de_overall+0);
   $cal_active=1 if($cal_active_inner);
@@ -18232,9 +18431,13 @@ if(ref($state) eq "HASH" && !defined($state->{"sdr_1d_dpg_body_target_logged"}) 
  # (single-socket commit) before the post-cal series read.
  $state->{"sdr_dpg_calibration_mode_held"}=($cal_active ? JSON::PP::true : JSON::PP::false);
  $state->{"calibration_mode"}=$cal_active ? JSON::PP::true : JSON::PP::false;
- $state->{"message"}=sprintf("SDR26 1D DPG greyscale complete: %d inner iters across %d anchors, final max dE=%.3f, target<=%.2f, exit=%s",$total_inner_iters,scalar(@done),$max_de_overall,$target_de,$exit_reason);
+ # Carried-forward near-black anchors are not failures, but they ARE part of an
+ # honest completion summary: report how many patches were left uncorrected.
+ my $_skipped=(ref($state->{"sdr_1d_dpg_skipped_anchors"}) eq "ARRAY") ? scalar(@{$state->{"sdr_1d_dpg_skipped_anchors"}}) : 0;
+ my $_skip_note=$_skipped ? sprintf(", %d near-black patch%s left uncorrected (below meter floor)",$_skipped,($_skipped==1?"":"es")) : "";
+ $state->{"message"}=sprintf("SDR26 1D DPG greyscale complete: %d inner iters across %d anchors, final max dE=%.3f, target<=%.2f, exit=%s%s",$total_inner_iters,scalar(@done),$max_de_overall,$target_de,$exit_reason,$_skip_note);
  write_state($state);
- log_line("SDR26 1D DPG greyscale: ".$total_inner_iters." inner iters across ".scalar(@done)." anchors, final max dE=".sprintf("%.3f",$max_de_overall)." (committed; per-anchor trajectory available in sdr_1d_dpg_anchor_history), target=".$target_de.", exit=".$exit_reason.", cal_held=".$cal_active);
+ log_line("SDR26 1D DPG greyscale: ".$total_inner_iters." inner iters across ".scalar(@done)." anchors, final max dE=".sprintf("%.3f",$max_de_overall)." (committed; per-anchor trajectory available in sdr_1d_dpg_anchor_history), target=".$target_de.", exit=".$exit_reason.", cal_held=".$cal_active.$_skip_note);
  my $terminal_error=autocal_dpg_terminal_error(
   "SDR26 1D DPG",
   $upload_failed,
