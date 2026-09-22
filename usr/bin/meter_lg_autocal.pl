@@ -15235,6 +15235,14 @@ sub lg_autocal_26_run_hdr20_dpg_greyscale {
 	$state->{"hdr20_1d_dpg_white_ref"}=$white_ref+0;
 
 	my @done;
+	# The near-black skip gate refuses to skip until the meter has proved itself
+	# by returning a valid read THIS pass, so a dead meter still aborts the job
+	# instead of silently "carrying forward" every patch. Scope that proof to the
+	# sweep explicitly. Today it is already per-sweep -- the worker builds $state
+	# fresh per process, never reloads it from the state file, and this sub runs
+	# once -- so this is invariant enforcement, not a live bug fix: it keeps the
+	# flag honest if the sweep is ever re-entered or the state is ever resumed.
+	delete $state->{"hdr20_1d_dpg_saw_valid_read"} if(ref($state) eq "HASH");
 	my $total_steps=scalar(@ordered);
 	my $total_inner_iters=0;
 	# $max_de_overall tracks the full trajectory including reverted overshoots
@@ -16271,6 +16279,12 @@ sub lg_autocal_26_run_hdr20_dpg_greyscale {
 		# an early barely-valid iteration is not baked in when a later iteration
 		# goes sub-floor and skips (see the SDR path for the full rationale).
 		my $_pre_anchor_dpg=[@{$current_dpg}];
+		# Snapshot the anchor list too, mirroring the SDR path. calibrate_anchor
+		# only ever assigns @done from its own snapshots today, so the contents
+		# cannot drift within an anchor -- but that is a property of the closure,
+		# not of this handler. Keeping the restore symmetric means adding a push
+		# there later cannot silently reintroduce the SDR partial-correction bug.
+		my $_pre_anchor_done=[map { +{ %$_ } } @done];
 		# A deepest near-black anchor that reads sub-floor throws the skip
 		# sentinel from inside calibrate_anchor. Catch it here, restore the
 		# pre-anchor curve so the patch really is left uncorrected (neighbors
@@ -16281,10 +16295,24 @@ sub lg_autocal_26_run_hdr20_dpg_greyscale {
 		if(!$_anchor_ok) {
 			my $_e=$@;
 			die $_e if(!autocal_nearblack_skip_marker($_e));
+			my $_skip_label=(ref($_e) eq "HASH" && $_e->{"label"}) ? $_e->{"label"} : $label;
 			@{$current_dpg}=@{$_pre_anchor_dpg};
-			$state->{"hdr20_1d_dpg_data"}=$current_dpg if(ref($state) eq "HASH");
+			@done=map { +{ %$_ } } @{$_pre_anchor_done};
+			if(ref($state) eq "HASH") {
+				$state->{"hdr20_1d_dpg_data"}=$current_dpg;
+				$state->{"hdr20_1d_dpg_anchors_done"}=scalar(@done);
+			}
 			my ($_ru_ok,$_ru_msg)=$upload_dpg->($current_dpg);
-			log_line("HDR20 1D DPG greyscale: carried ".($_e->{"label"}||$label)." forward (uncorrected, pre-anchor curve restored".($_ru_ok?"":"; re-upload failed: ".($_ru_msg//"unknown"))."); sweep continues") if(ref($_e) eq "HASH");
+			# Terminal for the same reason as the SDR path: a failed restore leaves
+			# the panel on the provisional correction while the solver state has
+			# been rolled back, so later anchors would measure the wrong curve.
+			if(!$_ru_ok) {
+				$upload_failed=1;
+				$exit_reason="restore_upload_failed";
+				log_line("HDR20 1D DPG greyscale: restoring the pre-anchor curve after ".$_skip_label." FAILED (".($_ru_msg//"unknown")."); the panel no longer matches the solver state, aborting the sweep");
+				last;
+			}
+			log_line("HDR20 1D DPG greyscale: carried ".$_skip_label." forward (uncorrected, pre-anchor curve restored); sweep continues");
 			next;
 		}
 		push @done,{idx=>$idx,r_gain=>1.0,g_gain=>1.0,b_gain=>1.0};
@@ -18180,6 +18208,9 @@ sub lg_autocal_26_run_sdr_1d_dpg_greyscale {
   }
 
   my @done;
+ # Scope the meter-proof flag to this sweep; see the HDR20 sweep for why this is
+ # invariant enforcement rather than a live bug fix.
+ delete $state->{"sdr_1d_dpg_saw_valid_read"} if(ref($state) eq "HASH");
  # Progress bar total: every ordered step including peak + mid-spine revisits
  # + Full 100% recal. current_step was never written on the SDR path (only
  # HDR sets it), so the WebUI sat at 0/N for the whole greyscale pass.
@@ -18309,6 +18340,15 @@ if(ref($state) eq "HASH" && !defined($state->{"sdr_1d_dpg_body_target_logged"}) 
   # would contradict "left uncorrected" and, for the lowest SDR body index,
   # bake a single noisy near-floor sample into the committed curve permanently.
   my @_pre_anchor_dpg=@{$current_dpg};
+  # Snapshot the finalized anchor list alongside the curve. The inner pushes a
+  # provisional anchor onto @done after EVERY accepted upload, so an anchor that
+  # uploads a correction on an early barely-valid iteration and only then goes
+  # sub-floor leaves its gains in @done. Restoring the curve alone is not enough:
+  # the next anchor's spline rebuild reads @done and re-applies those gains to
+  # the restored curve, so the patch is reported "left uncorrected" while having
+  # silently moved the committed curve. Shallow-copy each hashref (the @done
+  # idiom used throughout) so a later revert cannot alias back into the snapshot.
+  my @_pre_anchor_done=map { +{ %$_ } } @done;
   # A deepest near-black anchor that reads sub-floor throws the skip sentinel
   # from inside the inner sub. Catch it here, restore the pre-anchor curve so
   # the patch really is left uncorrected (neighboring anchors interpolate
@@ -18324,10 +18364,27 @@ if(ref($state) eq "HASH" && !defined($state->{"sdr_1d_dpg_body_target_logged"}) 
   if(!$_inner_ok) {
    my $_e=$@;
    die $_e if(!autocal_nearblack_skip_marker($_e));
+   my $_skip_label=(ref($_e) eq "HASH" && $_e->{"label"}) ? $_e->{"label"} : $label;
    @{$current_dpg}=@_pre_anchor_dpg;
-   $state->{"sdr_1d_dpg_data"}=$current_dpg if(ref($state) eq "HASH");
+   @done=map { +{ %$_ } } @_pre_anchor_done;
+   if(ref($state) eq "HASH") {
+    $state->{"sdr_1d_dpg_data"}=$current_dpg;
+    $state->{"sdr_1d_dpg_anchors_done"}=scalar(@done);
+   }
    my ($_ru_ok,$_ru_msg)=$upload_dpg->(\@{$current_dpg});
-   log_line("SDR26 1D DPG greyscale: carried ".($_e->{"label"}||$label)." forward (uncorrected, pre-anchor curve restored".($_ru_ok?"":"; re-upload failed: ".($_ru_msg//"unknown"))."); sweep continues") if(ref($_e) eq "HASH");
+   # Exhausting the restore upload's own retries is terminal, not a skip. The
+   # panel is still running the provisional correction while the solver has
+   # rolled back to the pre-anchor curve, so every later anchor would be
+   # measured against a curve the TV is not displaying -- and the sweep could
+   # still report uploaded=true. Fail through the normal upload-failure path,
+   # which stops the sweep, skips smoothing and forces uploaded=false.
+   if(!$_ru_ok) {
+    $upload_failed=1;
+    $exit_reason="restore_upload_failed";
+    log_line("SDR26 1D DPG greyscale: restoring the pre-anchor curve after ".$_skip_label." FAILED (".($_ru_msg//"unknown")."); the panel no longer matches the solver state, aborting the sweep");
+    last;
+   }
+   log_line("SDR26 1D DPG greyscale: carried ".$_skip_label." forward (uncorrected, pre-anchor curve restored); sweep continues");
    next;
   }
   $total_inner_iters+=$inner_iters;

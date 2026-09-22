@@ -16,6 +16,10 @@ use JSON::PP ();
 do "$Bin/../usr/bin/meter_lg_autocal.pl"; die $@ if $@;
 local *main::write_state=sub {};
 local *main::log_line=sub {};
+# cancelled() consults a stop FILE at a fixed path shared with any real run on
+# this machine. A leftover /tmp/meter_lg_autocal.stop made every sweep below
+# exit instantly and pass vacuously, so pin cancellation off for the whole file.
+local *main::cancelled=sub {0};
 
 my $UNMEASURABLE="No usable meter measurement for sdr26_2.3% after 4 sample attempts; check the signal range, displayed patch and meter alignment";
 
@@ -108,6 +112,15 @@ sub run_sdr26 {
  my $clean="; check the signal range, displayed patch and meter alignment";
  my $suffix=defined($opt{fail_suffix}) ? $opt{fail_suffix} : "";
  my %valid_seen;
+ my %first_seen;
+ # Once the target patch has gone unmeasurable, the very next upload is the
+ # skip handler restoring the pre-anchor curve. fail_upload_after_skip makes
+ # every one of its four retries fail, modeling a TV that drops off the wire.
+ my $gone_unmeasurable=0;
+ # Dark Detail adds the 2, 2.7, 3.7, 6, 8, 9 fillers. It is what puts an anchor
+ # BELOW the deepest standard 2.3% one: the sweep runs high->low, so without it
+ # 2.3% is the last anchor and nothing afterwards can consume a polluted @done.
+ local $main::LG_AUTOCAL_DARK_DETAIL=$opt{dark_detail} ? 1 : 0;
  # Read every patch as a plausible BT.1886 luminance so the sweep converges
  # quickly -- except the target IRE, which is physically unmeasurable. With
  # valid_first set, the target IRE returns ONE barely-valid read (as a patch
@@ -120,12 +133,24 @@ sub run_sdr26 {
    if($opt{valid_first} && !$valid_seen{sprintf("%.3f",$ire)}++) {
     return ({X=>0.02*0.95,Y=>0.02,Z=>0.02*1.09,x=>0.3127,y=>0.329,luminance=>0.02},undef);
    }
+   $gone_unmeasurable=1;
    return (undef,"No usable meter measurement for ".($rs->{name}||"patch")." after 4 sample attempts".$clean.$suffix);
   }
   my $y=($ire/100.0)**2.4*100.0; $y=0.0005 if($y<=0);
+  # A panel that already measures exactly on target converges on iteration 1 and
+  # never rebuilds the curve, which hides anything wrong with the anchor list.
+  # Read each patch 25% high ONCE so every anchor actually computes a
+  # correction, uploads it and then converges -- the real sweep's behavior.
+  $y*=1.25 if($opt{needs_correction} && !$first_seen{sprintf("%.3f",$ire)}++);
   return ({X=>$y*0.95,Y=>$y,Z=>$y*1.09,x=>0.3127,y=>0.329,luminance=>$y},undef);
  };
- local *main::api_json=sub { return {status=>'ok'}; };
+ local *main::api_json=sub {
+  my ($method,$path)=@_;
+  return {status=>'error',message=>'TV unreachable'}
+   if($opt{fail_upload_after_skip} && $gone_unmeasurable
+      && defined($path) && $path=~m{1d-dpg/upload});
+  return {status=>'ok'};
+ };
  # The full greyscale path emits a pre-existing "isn't numeric" warning from one
  # specific internal range check (line 1342) unrelated to this fix; suppress
  # only that exact line so any NEW numeric warning from the change still surfaces.
@@ -174,6 +199,97 @@ sub run_sdr26 {
  is_deeply($state_b->{sdr_1d_dpg_data},$state_a->{sdr_1d_dpg_data},
   'a partial correction from an early barely-valid read is NOT baked into the committed curve (patch truly left uncorrected)');
 }
+{
+ # The same guard, but for the ANCHOR LIST rather than the curve. The inner
+ # pushes a provisional anchor onto @done after every accepted upload, so a
+ # patch that corrects once and then goes sub-floor leaves its gains there.
+ # Restoring only the curve is not enough: the next anchor rebuilds the spline
+ # FROM @done and re-applies them, moving the committed curve while the patch
+ # is still reported "left uncorrected".
+ #
+ # Two conditions are needed to observe it, and the original version of this
+ # test had neither:
+ #   * Dark Detail on, so a 2% anchor runs AFTER the skipped 2.3% one (the
+ #     sweep descends, so 2.3% is otherwise the final anchor);
+ #   * a later anchor that actually rebuilds, which needs a panel that is off
+ #     target (needs_correction) rather than already perfect.
+ # Without the restore this diverges by ~99 of 3072 entries.
+ my %dd=(dark_detail=>1, needs_correction=>1);
+ my (undef,$died_a,$state_a)=run_sdr26(2.3,%dd);
+ my (undef,$died_b,$state_b)=run_sdr26(2.3,%dd, valid_first=>1);
+ is($died_a,'','dark-detail control run (fail-first) completes');
+ is($died_b,'','dark-detail valid-then-fail run completes');
+ is(scalar(@{$state_b->{sdr_1d_dpg_skipped_anchors}||[]}),1,'the 2.3% patch is still carried forward with Dark Detail on');
+ is_deeply($state_b->{sdr_1d_dpg_data},$state_a->{sdr_1d_dpg_data},
+  'the provisional anchor is removed from @done too, so a LATER anchor cannot re-apply the skipped patch gains');
+}
+{
+ # Restoring the pre-anchor curve can itself fail. Exhausting its four retries
+ # leaves the panel on the provisional correction while the solver has rolled
+ # back, so every later anchor would be measured against a curve the TV is not
+ # displaying. That is terminal, not a skip: the sweep must stop and must NOT
+ # claim the curve was committed.
+ my ($err,$died,$state)=run_sdr26(2.3, valid_first=>1, fail_upload_after_skip=>1);
+ is($died,'','a failed restore is reported, not thrown as an uncaught die');
+ like($err,qr/upload failed/,'SDR reports a terminal upload failure to the caller');
+ ok(!$state->{sdr_1d_dpg_uploaded},'SDR does not claim the 1D DPG was uploaded after a failed restore');
+ is($state->{sdr_1d_dpg_exit_reason},'restore_upload_failed','SDR records the machine-readable restore-failure cause');
+}
+
+# ---------------------------------------------------------------------------
+# 4b. The HDR20 solver's skip handler, via the existing single-anchor test mode.
+#     The 1% HDR20 anchor at a 600-nit reference targets ~0.024 nits -- genuinely
+#     below the meter floor margin, which is the physical case this feature
+#     exists for. (At a 1000-nit reference even 1% targets ~0.040 nits and is
+#     correctly NOT skippable, so the reference has to be a dim one.)
+# ---------------------------------------------------------------------------
+sub run_hdr20 {
+ my (%opt)=@_;
+ my $state={};
+ my $valid=0;
+ my $gone_unmeasurable=0;
+ # 1% is only a legal HDR20 DDC slot when the Dark Detail ladder is merged.
+ local $main::LG_AUTOCAL_DARK_DETAIL=1;
+ local $main::LG_AUTOCAL_DDC_LAYOUT="hdr20";
+ # One barely-valid read (which proves the meter AND uploads a provisional
+ # correction), then physically unmeasurable -- the dangerous ordering.
+ local *main::read_step=sub {
+  if(!$valid++) { return ({X=>0.019,Y=>0.02,Z=>0.0218,x=>0.3127,y=>0.329,luminance=>0.02},undef); }
+  $gone_unmeasurable=1;
+  return (undef,"No usable meter measurement for 1% after 4 sample attempts; check the signal range, displayed patch and meter alignment");
+ };
+ local *main::api_json=sub {
+  my ($method,$path)=@_;
+  return {status=>'error',message=>'TV unreachable'}
+   if($opt{fail_upload_after_skip} && $gone_unmeasurable
+      && defined($path) && $path=~m{1d-dpg/upload});
+  return {status=>'ok'};
+ };
+ my @dpg=map {($_%1024)*32} 0..3071;
+ my ($err,$died);
+ { local $@; $err=eval { main::lg_autocal_26_run_hdr20_dpg_greyscale({
+    signal_mode=>'hdr10', target_delta_e=>0.5,
+    hdr20_test_anchor_ire=>1, hdr20_test_snapshot_dpg=>\@dpg, hdr20_test_white_ref=>600,
+    steps=>[{name=>'1%',ire=>1,stimulus=>1,ddc_layout=>'hdr20',r=>41,g=>41,b=>41,input_max=>4095}],
+   },$state,600,0.3127,0.329,'dolbyVisionFilmMaker') }; $died=$@; }
+ return ($err,$died,$state);
+}
+{
+ # Control: the restore upload succeeds, so the patch is carried forward and
+ # the sweep finishes -- the HDR20 mirror of the SDR end-to-end case.
+ my ($err,$died,$state)=run_hdr20();
+ is($died,'','HDR20 does NOT die when the deepest near-black patch is unmeasurable');
+ is(scalar(@{$state->{hdr20_1d_dpg_skipped_anchors}||[]}),1,'HDR20 records the carried-forward near-black patch');
+ is($state->{hdr20_1d_dpg_skipped_anchors}[0]{ire},1,'and it is the 1% patch');
+}
+{
+ # The restore upload exhausts its retries: terminal, exactly as on the SDR path.
+ my ($err,$died,$state)=run_hdr20(fail_upload_after_skip=>1);
+ is($died,'','a failed HDR20 restore is reported, not thrown as an uncaught die');
+ like($err,qr/upload failed/,'HDR20 reports a terminal upload failure to the caller');
+ ok(!$state->{hdr20_1d_dpg_uploaded},'HDR20 does not claim the 1D DPG was uploaded after a failed restore');
+ is($state->{hdr20_1d_dpg_exit_reason},'restore_upload_failed','HDR20 records the machine-readable restore-failure cause');
+}
 
 # ---------------------------------------------------------------------------
 # 5. Load-bearing call sites (a passing suite must not survive their deletion).
@@ -199,5 +315,17 @@ like($hdr_fatal[0],qr/100% white reference/,'and it is the white-reference seed 
 ok($src =~ /autocal_nearblack_skip_marker\(\$_e\)/, 'an outer loop distinguishes the skip sentinel from a fatal die');
 my @markers=($src =~ /if\(!autocal_nearblack_skip_marker\(\$_e\)\)/g);
 ok(scalar(@markers) >= 2, 'both the SDR and HDR outer loops re-propagate real fatal errors unchanged');
+
+# Both handlers snapshot the anchor list as well as the curve, and treat an
+# exhausted restore upload as terminal. The end-to-end tests above cover the SDR
+# anchor-list restore directly; these pin the HDR half, whose single-anchor test
+# mode cannot exercise a following anchor.
+my @done_snapshots=($src =~ /_pre_anchor_done/g);
+ok(scalar(@done_snapshots) >= 4, 'both solvers snapshot AND restore the anchor list, not just the curve');
+# Pin the skip handlers' own abort, not the exit_reason string: an unrelated
+# revert path already used "restore_upload_failed", so counting that would stay
+# satisfied with one of these two handlers deleted.
+my @restore_terminal=($src =~ /no longer matches the solver state/g);
+is(scalar(@restore_terminal),2,'both solvers abort the sweep when the skip restore upload cannot be committed');
 
 done_testing();
