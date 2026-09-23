@@ -3404,14 +3404,71 @@ sub autocal_dpg_meter_floor {
  return $floor;
 }
 
-# The deepest near-black patches on some panels (notably the 2021 LG OLED C1
-# in SDR) emit light BELOW the colorimeter's usable floor: the meter returns
-# no valid sample after the whole retry budget, luminance error ~ -90%, frozen
-# reads. Historically that unmeasurable read aborted the ENTIRE greyscale job
-# (autocal_dpg_read_failure -> die), discarding a sweep that was otherwise
-# complete. This predicate decides -- conservatively -- when such a failure is
-# an EXPECTED sub-floor condition that should be carried forward (the patch is
-# left uncorrected and interpolated from its neighbors) rather than fatal.
+# Relative moves that separate a responsive near-black patch from one that is
+# not receiving the code being corrected. A 10% move of the anchor's LUT value
+# changes emitted light by roughly twice that near black, so a responsive patch
+# clears 5% easily; a patch showing a different code does not move at all.
+our $AUTOCAL_DPG_RESPONSE_MIN_LUT_MOVE=0.10;
+our $AUTOCAL_DPG_RESPONSE_MAX_FLAT_Y=0.05;
+
+# Record one valid read for the anchor being calibrated: its luminance and the
+# LUT values at this anchor's index that were on the panel when it was taken
+# (channel c lives at idx + 1024*c, as autocal_activity_upload reports them).
+sub autocal_dpg_note_anchor_read {
+ my ($history,$dpg,$idx,$reading)=@_;
+ return if(ref($history) ne "ARRAY" || ref($dpg) ne "ARRAY" || !defined($idx) || ref($reading) ne "HASH");
+ my $y=luminance($reading);
+ return if(!defined($y));
+ push @{$history},{y=>$y+0,lut=>[map { defined($dpg->[$idx+1024*$_]) ? $dpg->[$idx+1024*$_]+0 : undef } 0..2]};
+}
+
+# Positive evidence that the patch is not receiving the code the solver adjusts:
+# two valid reads straddling an accepted LUT move of at least 10% whose
+# luminance moved less than 5%. Returns a description for the log and the
+# fatal message, or undef when the reads are consistent with a responsive patch
+# or are too few to judge -- absence of evidence never blocks a skip.
+#
+# A genuinely sub-floor patch whose valid reads sit pinned at the meter's
+# quantization floor is also caught here and aborts. That is deliberate: a
+# wrong abort only restores the pre-skip behavior, while a wrong skip hides a
+# fault behind "left uncorrected".
+sub autocal_dpg_anchor_unresponsive {
+ my ($history)=@_;
+ return undef if(ref($history) ne "ARRAY" || @{$history} < 2);
+ for my $i (0..$#{$history}-1) {
+  for my $j ($i+1..$#{$history}) {
+   my ($first,$later)=($history->[$i],$history->[$j]);
+   my ($move,$ch)=(0,undef);
+   for my $c (0..2) {
+    my ($va,$vb)=($first->{"lut"}[$c],$later->{"lut"}[$c]);
+    next if(!defined($va) || !defined($vb) || $va <= 0);
+    my $rel=abs($vb-$va)/$va;
+    ($move,$ch)=($rel,$c) if($rel > $move);
+   }
+   next if($move < $AUTOCAL_DPG_RESPONSE_MIN_LUT_MOVE);
+   my $ymax=($first->{"y"} > $later->{"y"}) ? $first->{"y"} : $later->{"y"};
+   my $yrel=($ymax > 0) ? abs($later->{"y"}-$first->{"y"})/$ymax : 0;
+   next if($yrel >= $AUTOCAL_DPG_RESPONSE_MAX_FLAT_Y);
+   return sprintf("valid reads did not respond to a LUT change: Y %.4f -> %.4f cd/m2 (%.1f%%) while %s moved %d -> %d (%.0f%%)",
+    $first->{"y"},$later->{"y"},$yrel*100,('R','G','B')[$ch],$first->{"lut"}[$ch],$later->{"lut"}[$ch],$move*100);
+  }
+ }
+ return undef;
+}
+
+# A deepest near-black patch can emit light below the colorimeter's usable
+# floor, so the meter returns no valid sample after the whole retry budget.
+# Historically that aborted the ENTIRE greyscale job (autocal_dpg_read_failure
+# -> die), discarding a sweep that was otherwise complete. This predicate
+# decides -- conservatively -- when such a failure is an EXPECTED sub-floor
+# condition to carry forward (left uncorrected, interpolated from neighbors)
+# rather than fatal.
+#
+# The case that prompted this was sdr26_2.3% on an LG C1, and it was NOT a
+# physical floor: 10-bit patches were collapsed to 8-bit before the shader, so
+# code 84 was displayed as code 80 while the solver corrected row 21 (fixed in
+# the renderer since). That fault looks exactly like sub-floor darkness -- a
+# clean ladder exhaustion with no error suffix -- which is why guard 5 exists.
 #
 # ALL guards must agree, so a genuine meter / signal / alignment fault at a
 # patch that SHOULD be measurable still aborts the job:
@@ -3424,12 +3481,17 @@ sub autocal_dpg_meter_floor {
 #      the failure occurs in, and false for a bright calibration where an
 #      unreadable near-black patch is far more likely a real fault;
 #   4. the failure is the "no usable measurement" class, never a cancellation
-#      or an upload/endpoint error.
+#      or an upload/endpoint error;
+#   5. the patch has not shown it is unresponsive ($unresponsive): valid reads
+#      that stayed flat across an accepted LUT move mean the panel is not
+#      showing the code being corrected, which is a fault, not darkness.
 sub autocal_nearblack_unmeasurable_skip {
- my ($config,$prefix,$step,$expected_lum,$reason,$saw_valid_read)=@_;
+ my ($config,$prefix,$step,$expected_lum,$reason,$saw_valid_read,$unresponsive)=@_;
  return 0 if(ref($config) ne "HASH" || ref($step) ne "HASH");
  # Guard 1: the meter is proven this pass.
  return 0 if(!$saw_valid_read);
+ # Guard 5: positive evidence of a generator/coordinate fault always aborts.
+ return 0 if($unresponsive);
  # Guard 4: only the unmeasurable-sample class; never cancel or upload errors.
  return 0 if(!defined($reason) || $reason eq "" || $reason =~ /cancel/i);
  return 0 unless($reason =~ /No usable meter measurement|No usable meter reading|unusable reading|unusable all-zero/i);
@@ -3475,8 +3537,8 @@ sub autocal_nearblack_skip_marker {
 # throws the skip sentinel; otherwise it defers to autocal_dpg_read_failure,
 # whose fatal contract (phase=error, uploaded=false, read_failed) is unchanged.
 sub autocal_dpg_read_failure_or_skip {
- my ($state,$config,$prefix,$step,$idx,$label,$expected_lum,$reason,$saw_valid_read)=@_;
- if(autocal_nearblack_unmeasurable_skip($config,$prefix,$step,$expected_lum,$reason,$saw_valid_read)) {
+ my ($state,$config,$prefix,$step,$idx,$label,$expected_lum,$reason,$saw_valid_read,$unresponsive)=@_;
+ if(autocal_nearblack_unmeasurable_skip($config,$prefix,$step,$expected_lum,$reason,$saw_valid_read,$unresponsive)) {
   my $ire=(ref($step) eq "HASH" && defined($step->{"ire"})) ? ($step->{"ire"}+0) : undef;
   my $floor=autocal_dpg_meter_floor($config,$prefix);
   my $label_disp=defined($label) ? $label : "patch";
@@ -3504,7 +3566,49 @@ sub autocal_dpg_read_failure_or_skip {
   my $marker={ "__autocal_nearblack_skip__"=>1, idx=>$idx, label=>$label_disp, ire=>$ire };
   die $marker;
  }
+ # Name the flat response in the abort itself: it points at the renderer or the
+ # correction row, not at the meter, which is what an operator would check first.
+ if($unresponsive) {
+  log_line(sprintf("%s 1D DPG greyscale: %s not carried forward -- %s; the displayed code may not be the one being corrected, aborting",
+   ($prefix eq "hdr20" ? "HDR20" : "SDR26"),(defined($label) ? $label : "patch"),$unresponsive));
+  $reason=($reason//"No usable meter reading")."; ".$unresponsive;
+ }
  autocal_dpg_read_failure($state,$prefix,$label,$reason);
+}
+
+# Labels of the near-black patches this run carried forward, both layouts.
+sub autocal_nearblack_unmeasured_labels {
+ my ($state)=@_;
+ return () if(ref($state) ne "HASH");
+ my @labels;
+ for my $prefix (qw(sdr hdr20)) {
+  my $list=$state->{"${prefix}_1d_dpg_skipped_anchors"};
+  next if(ref($list) ne "ARRAY");
+  push @labels,map { (ref($_) eq "HASH" && defined($_->{"label"})) ? $_->{"label"} : "patch" } @{$list};
+ }
+ return @labels;
+}
+
+# Completion wording for a successful run. A carried-forward patch was never
+# measured, so its outcome is unknown, not verified (AGENTS.md). Say so in the
+# message every status view shows -- the sweep's own note is overwritten here --
+# and raise it as an automation processing warning, which the runner turns into
+# a complete-with-warnings item rather than one that reads as fully converged.
+sub autocal_apply_completion_outcome {
+ my ($state)=@_;
+ return if(ref($state) ne "HASH");
+ my @labels=autocal_nearblack_unmeasured_labels($state);
+ if(!@labels) {
+  $state->{"message"}="Auto Cal complete";
+  return;
+ }
+ my $n=scalar(@labels);
+ my $note=sprintf("%d near-black patch%s not measured (%s): left uncorrected, outcome unknown",$n,($n==1?"":"es"),join(", ",@labels));
+ $state->{"message"}="Auto Cal complete; ".$note;
+ my $warning="Greyscale: ".$note;
+ $state->{"automation_processing_warnings"}=[] if(ref($state->{"automation_processing_warnings"}) ne "ARRAY");
+ push @{$state->{"automation_processing_warnings"}},$warning
+  if(!grep { $_ eq $warning } @{$state->{"automation_processing_warnings"}});
 }
 
 sub committed_polish_far_from_target {
@@ -15319,11 +15423,15 @@ sub lg_autocal_26_run_hdr20_dpg_greyscale {
 		# proven, the IRE is deepest near-black, and the anchor target is at/below
 		# the meter floor. The expected target luminance is the same 2.2-curve
 		# value the probe-up and per-iter target use for this anchor.
+		# Every valid read of THIS anchor (probe-up included) with the LUT values it
+		# was taken at; see autocal_dpg_anchor_unresponsive.
+		my @_anchor_reads;
 		my $_hdr_read_failure=sub {
 			my ($reason)=@_;
 			my $_expected=target_luminance_for_step($white_ref,$rs,"2.2","hdr10",undef);
 			my $_saw=(ref($state) eq "HASH" && $state->{"hdr20_1d_dpg_saw_valid_read"}) ? 1 : 0;
-			autocal_dpg_read_failure_or_skip($state,$config,"hdr20",$rs,$idx,$label,$_expected,$reason,$_saw);
+			autocal_dpg_read_failure_or_skip($state,$config,"hdr20",$rs,$idx,$label,$_expected,$reason,$_saw,
+				autocal_dpg_anchor_unresponsive(\@_anchor_reads));
 		};
 		my $gamma_effective=lg_autocal_expected_gamma_for_signal_mode_and_ire($_anchor_signal_mode,$_anchor_ire);
 		$gamma_effective=1.5 if($gamma_effective+0 < 1.5);
@@ -15438,6 +15546,7 @@ sub lg_autocal_26_run_hdr20_dpg_greyscale {
 				log_line("HDR20 1D DPG greyscale: ".$label." probe-read initial measured_Y=".sprintf("%.5f",defined(luminance($probe_rd))?(luminance($probe_rd)//0):0));
 				# A valid read proves the meter this pass (gates the near-black skip).
 				$state->{"hdr20_1d_dpg_saw_valid_read"}=1 if(ref($state) eq "HASH");
+				autocal_dpg_note_anchor_read(\@_anchor_reads,$current_dpg,$idx,$probe_rd);
 			}
 			# The probe-up should stop when the measured luminance reaches this
 			# anchor's TARGET luminance (not just the meter floor). Using the
@@ -15487,6 +15596,7 @@ sub lg_autocal_26_run_hdr20_dpg_greyscale {
 					return (undef,undef) if(!$puk);
 					my ($rd,$err)=read_step($config,$rs,$state);
 					$_hdr_read_failure->($err) if($err || ref($rd) ne "HASH");
+					autocal_dpg_note_anchor_read(\@_anchor_reads,$current_dpg,$idx,$rd);
 					my $y=luminance($rd);
 					return ($rd,(defined($y)?$y+0:undef));
 				};
@@ -15562,6 +15672,7 @@ sub lg_autocal_26_run_hdr20_dpg_greyscale {
 			$last_reading=$reading;
 			# A valid read proves the meter this pass (gates the near-black skip).
 			$state->{"hdr20_1d_dpg_saw_valid_read"}=1 if(ref($state) eq "HASH");
+			autocal_dpg_note_anchor_read(\@_anchor_reads,$current_dpg,$idx,$reading);
 			# Target luminance per anchor on the 2.2 curve vs the peak white_ref,
 			# the SAME way for every anchor including 100% (where the target is
 			# white_ref, i.e. target_Yn=1.0). Luminance is reached purely by RGB
@@ -16934,12 +17045,16 @@ sub lg_autocal_26_run_sdr_1d_dpg_greyscale_inner {
  # the IRE is deepest near-black, and the target is at/below the meter floor;
  # otherwise it aborts exactly as before. The expected target luminance is the
  # same value the solver would compute for this anchor's dE below.
+ # Every valid read of THIS anchor, with the LUT values it was taken at, so the
+ # gate can refuse to carry forward a patch that never responded to correction.
+ my @_anchor_reads;
  my $_sdr_read_failure=sub {
   my ($reason)=@_;
   my $_tg=defined($config->{"target_gamma"}) ? $config->{"target_gamma"} : "bt1886";
   my $_expected=lg_autocal_26_sdr26_dpg_compute_target($white_ref,$rs,$black_y,$_tg);
   my $_saw=(ref($state) eq "HASH" && $state->{"sdr_1d_dpg_saw_valid_read"}) ? 1 : 0;
-  autocal_dpg_read_failure_or_skip($state,$config,"sdr",$rs,$idx,$label,$_expected,$reason,$_saw);
+  autocal_dpg_read_failure_or_skip($state,$config,"sdr",$rs,$idx,$label,$_expected,$reason,$_saw,
+   autocal_dpg_anchor_unresponsive(\@_anchor_reads));
  };
 
  for(my $i=1;$i<=$budget;$i++) {
@@ -16958,6 +17073,7 @@ sub lg_autocal_26_run_sdr_1d_dpg_greyscale_inner {
   # A valid read anywhere in the sweep proves the meter and signal path work;
   # the near-black skip gate requires this before it will carry a patch forward.
   $state->{"sdr_1d_dpg_saw_valid_read"}=1 if(ref($state) eq "HASH");
+  autocal_dpg_note_anchor_read(\@_anchor_reads,$current_dpg_ref,$idx,$reading);
   # Peak is chroma-only (Limited 109 legal / Full 100): targets OWN measured Y
   # so dE has zero luminance component -- only pull RGB into balance. Measured
   # Y becomes $white_ref for body anchors' gamma target-Y curve. Limited
@@ -17254,6 +17370,7 @@ sub lg_autocal_26_run_sdr_1d_dpg_greyscale_inner {
      my ($arr,$are)=read_step($config,$rs,$state);
      $_sdr_read_failure->($are) if($are || ref($arr) ne "HASH");
      if(!$are && ref($arr) eq "HASH") {
+      autocal_dpg_note_anchor_read(\@_anchor_reads,$current_dpg_ref,$idx,$arr);
       $reading=$arr;
       $last_reading=$arr;
       my $ade=autocal_delta_e_for_step($config,$arr,$rs,$white_ref,$target_x,$target_y,$tl);
@@ -27434,7 +27551,7 @@ eval {
 	  $state->{"status"}="complete";
 	  $state->{"phase"}="complete";
 	  $state->{"current_name"}="Auto Cal complete";
-	  $state->{"message"}="Auto Cal complete";
+	  autocal_apply_completion_outcome($state);
 	  $state->{"completed_at"}=int(time()*1000);
 	  $state->{"elapsed_ms"}=$state->{"completed_at"}-(($state->{"started_at"}||$state->{"completed_at"})+0);
 	  $state->{"elapsed_ms"}=0 if($state->{"elapsed_ms"}<0);

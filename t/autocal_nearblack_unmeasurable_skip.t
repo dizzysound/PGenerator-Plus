@@ -133,6 +133,11 @@ sub run_sdr26 {
    if($opt{valid_first} && !$valid_seen{sprintf("%.3f",$ire)}++) {
     return ({X=>0.02*0.95,Y=>0.02,Z=>0.02*1.09,x=>0.3127,y=>0.329,luminance=>0.02},undef);
    }
+   # flat_valid: the #30 signature -- N valid reads that never move, whatever
+   # the solver uploads, because the panel is not showing the corrected code.
+   if($opt{flat_valid} && ($valid_seen{sprintf("flat%.3f",$ire)}++ < $opt{flat_valid})) {
+    return ({X=>0.0021*0.95,Y=>0.0021,Z=>0.0021*1.09,x=>0.3127,y=>0.329,luminance=>0.0021},undef);
+   }
    $gone_unmeasurable=1;
    return (undef,"No usable meter measurement for ".($rs->{name}||"patch")." after 4 sample attempts".$clean.$suffix);
   }
@@ -291,6 +296,80 @@ sub run_hdr20 {
  is($state->{hdr20_1d_dpg_exit_reason},'restore_upload_failed','HDR20 records the machine-readable restore-failure cause');
 }
 
+
+# ---------------------------------------------------------------------------
+# 4c. Guard 5: a patch that ignores the LUT is a fault, not darkness.
+#     The one hardware firing of this gate was the #30 renderer defect: code 84
+#     shown as code 80, so two valid reads stayed at Y 0.0021 while the solver
+#     moved R 976 -> 1220 -> 1525. That passed guards 1-4 and was recorded as
+#     "left uncorrected". It must abort, naming the flat response.
+# ---------------------------------------------------------------------------
+{
+ my @dpg=(1000) x 3072;
+ my @h;
+ main::autocal_dpg_note_anchor_read(\@h,\@dpg,21,{Y=>0.0021,luminance=>0.0021});
+ is(scalar(@h),1,'a valid read is recorded with its luminance');
+ is_deeply($h[0]{lut},[1000,1000,1000],'and the R/G/B LUT values at idx, idx+1024 and idx+2048');
+ main::autocal_dpg_note_anchor_read(\@h,\@dpg,21,undef);
+ is(scalar(@h),1,'an invalid read is not recorded');
+ is(main::autocal_dpg_anchor_unresponsive(\@h),undef,'one read is too little evidence to call the patch unresponsive');
+
+ my $flat=[{y=>0.0021,lut=>[976,1023,996]},{y=>0.0021,lut=>[1220,1279,1245]},{y=>0.0021,lut=>[1525,1599,1556]}];
+ my $why=main::autocal_dpg_anchor_unresponsive($flat);
+ ok(defined($why),'the hardware sequence (flat Y across R 976 -> 1525) is unresponsive');
+ like($why,qr/did not respond to a LUT change: Y 0\.0021 -> 0\.0021/,'and the description names the flat luminance');
+
+ is(main::autocal_dpg_anchor_unresponsive([{y=>0.0100,lut=>[1000,1000,1000]},{y=>0.0125,lut=>[1100,1100,1100]}]),undef,
+  'a patch whose light followed a 10% LUT move is responsive');
+ is(main::autocal_dpg_anchor_unresponsive([{y=>0.0100,lut=>[1000,1000,1000]},{y=>0.0100,lut=>[1050,1050,1050]}]),undef,
+  'a LUT move under 10% is too small to judge, so it never blocks a skip');
+ is(main::autocal_dpg_anchor_unresponsive([{y=>0.0100,lut=>[1000,1000,1000]},{y=>0.0180,lut=>[1300,1000,1000]},{y=>0.0101,lut=>[1000,1000,1000]}]),undef,
+  'a move that was reverted is not a flat response (the LUT is the same again)');
+
+ ok(!main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,0.0117,$UNMEASURABLE,1,$why),
+  'guard 5: an otherwise-skippable patch is NOT skipped once it has shown a flat response');
+ my $state={};
+ eval { main::autocal_dpg_read_failure_or_skip($state,{},"sdr",$step_nb,21,"sdr26_2.3%",0.0117,$UNMEASURABLE,1,$why) };
+ ok(!main::autocal_nearblack_skip_marker($@),'the router aborts instead of throwing the skip sentinel');
+ like($@,qr/measurement failed at sdr26_2\.3%.*did not respond to a LUT change/,'and the abort names the flat response, which points at the renderer, not the meter');
+ ok(!$state->{sdr_1d_dpg_skipped_anchors},'nothing is recorded as carried forward');
+}
+{
+ # End to end through the real SDR solver: two flat valid reads, then
+ # unmeasurable. Before guard 5 this completed with the patch "left uncorrected".
+ my ($err,$died,$state)=run_sdr26(2.3, flat_valid=>2);
+ like($died,qr/measurement failed at .*2\.3%.*did not respond to a LUT change/,
+  'the real sweep aborts on the #30 signature rather than carrying the patch forward');
+ ok(!$state->{sdr_1d_dpg_skipped_anchors} || !@{$state->{sdr_1d_dpg_skipped_anchors}},'and records no skipped anchor');
+}
+
+# ---------------------------------------------------------------------------
+# 4d. The skip is visible at job level. The sweep's own note is overwritten by
+#     the worker's final "Auto Cal complete", so the outcome must be stated
+#     there and raised as a processing warning the runner lifts onto the item.
+# ---------------------------------------------------------------------------
+{
+ my $clean={};
+ main::autocal_apply_completion_outcome($clean);
+ is($clean->{message},'Auto Cal complete','a run with nothing carried forward keeps the plain completion message');
+ ok(!$clean->{automation_processing_warnings},'and raises no warning');
+
+ my $s={sdr_1d_dpg_skipped_anchors=>[{label=>'sdr26_2.3%'}]};
+ main::autocal_apply_completion_outcome($s);
+ is($s->{message},'Auto Cal complete; 1 near-black patch not measured (sdr26_2.3%): left uncorrected, outcome unknown',
+  'the completion message names the unmeasured patch and says its outcome is unknown');
+ is_deeply($s->{automation_processing_warnings},['Greyscale: 1 near-black patch not measured (sdr26_2.3%): left uncorrected, outcome unknown'],
+  'and the same note is raised as an automation processing warning');
+ main::autocal_apply_completion_outcome($s);
+ is(scalar(@{$s->{automation_processing_warnings}}),1,'applying it twice does not duplicate the warning');
+ ok((grep { $_ eq 'automation_processing_warnings' } @PGAutomation::WORKER_STATUS_SUMMARY_KEYS),
+  'the warning key is in the summary sidecar, so the persisted summary carries it');
+
+ my $h={hdr20_1d_dpg_skipped_anchors=>[{label=>'1%'}],sdr_1d_dpg_skipped_anchors=>[{label=>'sdr26_2.3%'},{label=>'sdr26_2%'}]};
+ main::autocal_apply_completion_outcome($h);
+ like($h->{message},qr/3 near-black patches not measured \(sdr26_2\.3%, sdr26_2%, 1%\)/,'several patches across layouts are all named');
+}
+
 # ---------------------------------------------------------------------------
 # 5. Load-bearing call sites (a passing suite must not survive their deletion).
 #    Model: t/idle_pattern_seed.t asserts the caller body contains the call.
@@ -327,5 +406,16 @@ ok(scalar(@done_snapshots) >= 4, 'both solvers snapshot AND restore the anchor l
 # satisfied with one of these two handlers deleted.
 my @restore_terminal=($src =~ /no longer matches the solver state/g);
 is(scalar(@restore_terminal),2,'both solvers abort the sweep when the skip restore upload cannot be committed');
+
+
+# Guard 5 is fed from BOTH solvers' read histories; an unwired history would
+# pass every unit test above while the gate never saw a flat response.
+my @resp_wired=($src =~ /autocal_dpg_anchor_unresponsive\(\\\@_anchor_reads\)/g);
+is(scalar(@resp_wired),2,'both read-failure routers pass the anchor read history to the gate');
+my @notes=($src =~ /autocal_dpg_note_anchor_read\(/g);
+ok(scalar(@notes) >= 5,'valid reads are recorded at every SDR and HDR read site that follows an upload');
+# The final completion goes through the outcome helper, not a bare literal.
+ok($src =~ /current_name"\}="Auto Cal complete";\s*autocal_apply_completion_outcome\(\$state\);/,
+ 'the successful completion states the carried-forward outcome instead of a bare "Auto Cal complete"');
 
 done_testing();
