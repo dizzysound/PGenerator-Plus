@@ -39,6 +39,14 @@ sub decode {
  my $buf=shift;
  my ($id,$flags,$qd,$an,$ns,$ar)=unpack("nnnnnn",substr($buf,0,12));
  my $off=12;
+ my @q;
+ for (1..$qd) {
+  my ($name,$next,$ok)=&main::webui_mdns_read_name($buf,$off);
+  die "bad question" if(!$ok);
+  my ($type,$class)=unpack("nn",substr($buf,$next,4));
+  push @q,{name=>$name,type=>$type,class=>$class};
+  $off=$next+4;
+ }
  my @rr;
  for my $section (('an') x $an,('ns') x $ns,('ar') x $ar) {
   my ($name,$next,$ok)=&main::webui_mdns_read_name($buf,$off);
@@ -48,7 +56,7 @@ sub decode {
   push @rr,{section=>$section,name=>$name,type=>$type,class=>$class,ttl=>$ttl,rdata=>$rdata,rdoff=>$next+10};
   $off=$next+10+$len;
  }
- return {flags=>$flags,qd=>$qd,an=>$an,ns=>$ns,ar=>$ar,rr=>\@rr,len=>length($buf),end=>$off};
+ return {id=>$id,q=>\@q,flags=>$flags,qd=>$qd,an=>$an,ns=>$ns,ar=>$ar,rr=>\@rr,len=>length($buf),end=>$off};
 }
 sub nsec_types {
  my ($buf,$rr)=@_;
@@ -118,11 +126,65 @@ is_deeply((nsec_types($pos,$add))[2],[1],'additional NSEC asserts that only A ex
 is(&main::webui_mdns_build_aaaa_negative_response('',$IP),'','no host name, no packet');
 is(&main::webui_mdns_build_aaaa_negative_response($HOST,''),'','no address, no packet');
 
+# --- Legacy unicast (RFC 6762 6.7) --------------------------------------------
+# A query from a source port other than 5353 comes from a plain resolver (dig,
+# nslookup). It needs a conventional reply: its own ID, its question echoed,
+# TTL <= 10s and no cache-flush bit, or the resolver discards the answer.
+my $legacy_q=pack("nnnnnn",0x1234,0,1,0,0,0).question("$HOST.local",1);
+my $leg=&main::webui_mdns_build_legacy_response($HOST,$IP,$legacy_q,1);
+$d=decode($leg);
+is($d->{id},0x1234,'legacy reply echoes the query ID');
+is($d->{flags},0x8400,'legacy reply is an authoritative response');
+is_deeply([@$d{qw(qd an ns ar)}],[1,1,0,1],'legacy reply carries the question, one answer, one additional');
+is_deeply($d->{q},[{name=>"$HOST.local",type=>1,class=>1}],'legacy reply echoes the question');
+is($d->{end},$d->{len},'the legacy reply has no trailing bytes');
+($ans)=grep { $_->{section} eq 'an' } @{$d->{rr}};
+is($ans->{type},1,'legacy A question is answered with the A record');
+is(Socket::inet_ntoa($ans->{rdata}),$IP,'legacy A answer carries the address');
+is($ans->{ttl},10,'legacy answer TTL is capped at 10 seconds');
+is($ans->{class},1,'legacy answer has no cache-flush bit');
+($add)=grep { $_->{section} eq 'ar' } @{$d->{rr}};
+is($add->{type},47,'legacy additional record is the NSEC');
+is_deeply([@$add{qw(ttl class)}],[10,1],'legacy NSEC is capped at 10s with no cache-flush bit');
+
+$legacy_q=pack("nnnnnn",0xBEEF,0,1,0,0,0).question("$HOST.local",28);
+$d=decode(&main::webui_mdns_build_legacy_response($HOST,$IP,$legacy_q,0));
+is($d->{id},0xBEEF,'legacy AAAA reply echoes the query ID');
+($ans)=grep { $_->{section} eq 'an' } @{$d->{rr}};
+is($ans->{type},47,'legacy AAAA-only question is answered with the NSEC');
+is_deeply([@$ans{qw(ttl class)}],[10,1],'legacy NSEC answer is capped at 10s with no cache-flush bit');
+is_deeply((nsec_types(&main::webui_mdns_build_legacy_response($HOST,$IP,$legacy_q,0),$ans))[2],[1],'legacy NSEC asserts that only A exists');
+
+# A compressed second question is echoed as a full name, so the reply decodes.
+$legacy_q=pack("nnnnnn",7,0,2,0,0,0).question("$HOST.local",1).pack("n",0xC00C).pack("nn",28,1);
+$d=decode(&main::webui_mdns_build_legacy_response($HOST,$IP,$legacy_q,1));
+is_deeply($d->{q},[{name=>"$HOST.local",type=>1,class=>1},{name=>"$HOST.local",type=>28,class=>1}],'bundled legacy questions are both echoed');
+is($d->{end},$d->{len},'the bundled legacy reply has no trailing bytes');
+
+is(&main::webui_mdns_build_legacy_response('',$IP,$legacy_q,1),'','legacy: no host name, no packet');
+is(&main::webui_mdns_build_legacy_response($HOST,'',$legacy_q,1),'','legacy: no address, no packet');
+is(&main::webui_mdns_build_legacy_response($HOST,$IP,'short',1),'','legacy: a truncated query gets no packet');
+
+# --- Multicast rate limit (RFC 6762 6) ------------------------------------------
+# A record may be multicast on an interface at most once per second. Every
+# packet carries both A and NSEC, so one timestamp per interface covers both.
+my %last;
+ok(&main::webui_mdns_multicast_due(\%last,$IP,100.0),'the first multicast on an interface is sent');
+ok(!&main::webui_mdns_multicast_due(\%last,$IP,100.5),'a multicast 0.5s later is held');
+ok(&main::webui_mdns_multicast_due(\%last,'10.0.0.1',100.5),'another interface keeps its own clock');
+ok(&main::webui_mdns_multicast_due(\%last,$IP,101.0),'a multicast a full second after the last one is sent');
+ok(!&main::webui_mdns_multicast_due(\%last,$IP,101.6),'the clock restarts from the last multicast sent');
+ok(&main::webui_mdns_multicast_due(\%last,$IP,102.0),'a held multicast does not push the clock back');
+
 # --- The responder loop uses both --------------------------------------------
 my $src=do { local(@ARGV,$/)="$Bin/../usr/share/PGenerator/webui.pm"; <> };
 my ($loop)=$src=~/^sub webui_mdns \(\@\) \{\n(.*?)^\}/ms;
 like($loop,qr/webui_mdns_query_wants\(\$buf,\$mdns_hostname\)/,'the responder classifies each packet');
 like($loop,qr/webui_mdns_build_aaaa_negative_response\(/,'the responder answers AAAA-only questions');
 unlike($loop,qr/\$qtype == 1 \|\| \$qtype == 255/,'the A-only inline match is gone');
+like($loop,qr/if\(\$qport != \$MDNS_PORT\) \{[^}]*webui_mdns_build_legacy_response\([^}]*send\(\$sock, \$resp, 0, \$from\);[^}]*next;\n\s*\}/,'a legacy query gets a unicast-only reply');
+like($loop,qr/webui_mdns_multicast_due\(\\%mdns_last_multicast,\$best_ip,/,'replies are multicast through the rate limit');
+like($loop,qr/webui_mdns_multicast_due\(\\%mdns_last_multicast,\$route->\{ip\},/,'announcements share the rate limit');
+like($loop,qr/CLOCK_MONOTONIC/,'the rate limit runs on the monotonic clock');
 
 done_testing();
