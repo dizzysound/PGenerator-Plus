@@ -73,7 +73,30 @@ let current=null;const runs={'finished-run':'complete','active-run':'running'},c
   s=await state(page);
   assert.equal(await page.evaluate(()=>pgAutomation.editingRunId),'active-run','a running batch stays bound');
   assert.equal(s.start,'none');assert.match(s.context,/Editing pending items for active-run/);
+  // Declining the question leaves everything as it was.
+  await page.evaluate(()=>{globalThis.pgAutomationConfirmOverride=()=>false;});
+  await page.click('#pgAutomationStopEditingButton');await page.evaluate(()=>pgAutomationNewQueue());
+  assert.equal(await page.evaluate(()=>pgAutomation.editingRunId),'active-run','cancel keeps the binding');
+  assert.ok(!await page.$eval('#pgAutomationQueueDialog',el=>el.open),'cancel does not open the new-queue dialog');
+  // Stop editing: the way out while the batch is still running.
+  await page.evaluate(()=>{globalThis.pgAutomationConfirmOverride=()=>true;});
+  await page.click('#pgAutomationStopEditingButton');
+  await page.evaluate(()=>pgAutomationPollLive());
+  s=await state(page);
+  assert.notEqual(s.start,'none','Run queue returns after Stop editing');
+  assert.deepEqual(s.names,[],'the page starts from an empty queue');
+  assert.equal(s.saved,'','the stored draft is unbound');assert.equal(s.context,'');
+  assert.match(s.notice,/Stopped editing active-run/);
+  assert.ok(!calls.some(call=>call.startsWith('POST /api/automation/runs/active-run')),'the batch itself is never touched');
   assert.deepEqual(errors,[]);await page.close();
-  console.log('PASS stale edit binding released for missing, finished and polled-terminal runs; active run stays bound');
+
+  // + New queue while bound asks once, then opens the dialog instead of refusing.
+  ({page,errors}=await open('active-run'));
+  await page.evaluate(()=>{globalThis.pgAutomationConfirmOverride=()=>true;});
+  await page.evaluate(()=>pgAutomationNewQueue());
+  assert.equal(await page.evaluate(()=>pgAutomation.editingRunId),'','+ New queue ends the edit');
+  assert.ok(await page.$eval('#pgAutomationQueueDialog',el=>el.open),'+ New queue opens its dialog');
+  assert.deepEqual(errors,[]);await page.close();
+  console.log('PASS stale edit binding released for missing, finished and polled-terminal runs; active run stays bound until Stop editing or + New queue');
  }finally{await browser.close();await new Promise(resolve=>server.close(resolve));}
 })().catch(error=>{console.error(error);process.exitCode=1});

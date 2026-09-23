@@ -1013,7 +1013,7 @@ function pgAutomationRenderQueue(){
  pgAutomationEl('QueueSaveState').textContent=pgAutomation.editingRunId?'Editing pending jobs':reference?(dirty?'Reference copy · unsaved changes':'Reference settings · copy this queue to make your own'):pgAutomation.queue.id?(dirty?'Unsaved changes':'Saved queue'):'Not saved yet';
  const save=pgAutomationEl('SaveQueueButton');save.textContent=reference?'Copy queue':pgAutomation.queue.id?'Save changes':'Save queue';save.disabled=!!pgAutomation.editingRunId||(!reference&&!!pgAutomation.queue.id&&!dirty);
  pgAutomationRenderSavedQueues();
- pgAutomationEl('QueueContext').textContent=pgAutomation.editingRunId?'Editing pending items for '+pgAutomation.editingRunId+'. Active and completed items are locked.':'';
+ pgAutomationEl('QueueContext').innerHTML=pgAutomation.editingRunId?'Editing pending items for '+pgAutomationEscape(pgAutomation.editingRunId)+'. Active and completed items are locked. <button class="btn btn-sm btn-secondary" id="pgAutomationStopEditingButton" type="button" style="margin:4px 0 8px" onclick="pgAutomationStopEditing()">Stop editing</button>':'';
  pgAutomationEl('SavePendingButton').style.display=pgAutomation.editingRunId?'':'none';
  pgAutomationEl('StartButton').style.display=pgAutomation.editingRunId?'none':'';
  pgAutomationEl('QueueItems').innerHTML=pgAutomation.queue.items.length?pgAutomation.queue.items.map((item,i)=>{
@@ -1058,12 +1058,25 @@ function pgAutomationDragStart(event,index){
  document.addEventListener('pointermove',move);document.addEventListener('pointerup',up);document.addEventListener('pointercancel',cancel);document.addEventListener('keydown',key);window.addEventListener('blur',cleanup);
 }
 function pgAutomationDragCancel(){pgAutomation.dragCancel?.();}
-function pgAutomationNewQueue(){
- pgAutomationNameQueue('new');
+async function pgAutomationNewQueue(){
+ if(await pgAutomationStopEditing())pgAutomationNameQueue('new');
+}
+// The way out of editing a batch's pending jobs. The batch keeps the jobs it
+// has saved; only this browser's unsaved pending changes are dropped, and the
+// page starts over from an empty queue.
+async function pgAutomationStopEditing(){
+ const id=pgAutomation.editingRunId;if(!id)return true;
+ if(!await pgAutomationConfirm('Stop editing the pending jobs of '+id+' and start an empty queue? Unsaved pending changes are discarded. The batch itself is not changed.','Stop editing'))return false;
+ if(pgAutomation.editingRunId!==id)return true;
+ pgAutomation.queue={name:'TV calibration queue',items:[]};
+ pgAutomation.editingRunId='';pgAutomation.firstPending=0;pgAutomation.editChecked='';pgAutomation.selectedQueue='';pgAutomation.loadedQueueSnapshot='';
+ pgAutomationSaveDraft();pgAutomationRenderSavedQueues();pgAutomationRenderQueue();
+ pgAutomationNotice('Stopped editing '+id+'. The batch keeps its saved jobs; this queue is empty.');
+ return true;
 }
 function pgAutomationSaveSelectedQueue(){if(pgAutomation.queue.id&&!pgAutomation.editingRunId)pgAutomationQueueSave();else pgAutomationNameQueue('copy');}
 function pgAutomationNameQueue(action){
- if(pgAutomation.editingRunId){pgAutomationNotice('Save pending changes before creating or renaming a queue.',true);return;}
+ if(pgAutomation.editingRunId){pgAutomationNotice('Save Pending Changes, or choose Stop editing, before copying or renaming a queue.',true);return;}
  pgAutomation.queueNameAction=action;
  pgAutomationEl('QueueMenu').open=false;
  pgAutomationEl('QueueDialogTitle').textContent=action==='new'?'New queue':action==='copy'?'Copy queue':'Rename queue';
