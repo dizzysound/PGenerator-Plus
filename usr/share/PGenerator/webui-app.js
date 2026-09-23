@@ -2208,10 +2208,9 @@ function dvRgbMaxBpc(value){
  return String(value||'').trim()==='10' ? '10' : '8';
 }
 function dvTransportDefaults(mode){
- if(String(mode||'').toLowerCase()==='lldv'){
-  // Low-latency (source-led) DV: PQ YCbCr 4:2:2 12-bit, LL bit in the VSIF.
-  return {dv_transport:'lldv',is_ll_dovi:'1',is_std_dovi:'0',dv_interface:'1',color_format:'2',max_bpc:'12'};
- }
+ // Low Latency DV is retired (see pg_dv_transport_mode in variables.pm): it
+ // kills the Pi renderer at EGL config selection, so DV is always standard here,
+ // and dvTransportMode() already forces the select to the standard value.
  return {dv_transport:'standard',is_ll_dovi:'0',is_std_dovi:'1',dv_interface:'0',color_format:'0',max_bpc:'8'};
 }
 
@@ -2276,7 +2275,7 @@ async function applySettings(){
 	   dv_transport:dvTransport.dv_transport,
 	   is_ll_dovi:dvTransport.is_ll_dovi,is_std_dovi:dvTransport.is_std_dovi,
    dv_status:'1',primaries:'1',color_format:dvTransport.color_format,colorimetry:'9',
-   max_bpc:(dvTransport.dv_transport==='lldv'?dvTransport.max_bpc:dvRgbMaxBpc(getVal('max_bpc'))),
+   max_bpc:dvRgbMaxBpc(getVal('max_bpc')),
    rgb_quant_range:'2',eotf:'2',
    dv_interface:dvTransport.dv_interface,
    dv_map_mode:getVal('dv_map_mode'),
