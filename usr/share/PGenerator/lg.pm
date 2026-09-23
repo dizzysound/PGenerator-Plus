@@ -1641,8 +1641,12 @@ sub lg_update_connect_metadata (@) {
     delete($clients->{"disconnected"});
     delete($clients->{"disconnected_at"});
     delete($clients->{"last_error"});
+    delete($clients->{"connect_failed_at"});
  } else {
     $clients->{"last_error"}=$result->{"message"}||"LG connection failed";
+    # Open ports do not prove the SSAP session works (a rejected key or handshake
+    # timeout); status reports not connected until a connect succeeds again.
+    $clients->{"connect_failed_at"}=time();
  }
  &lg_save_clients($clients);
  return $clients;
@@ -1706,7 +1710,8 @@ sub lg_status_data (@) {
  # readiness, resume and the runner trust `connected` to skip reconnecting.
  my $probe_ip=$stored_ip ne "" ? $stored_ip : ($manual_ip ne "" ? $manual_ip : $auto_ip);
  my $reachable=($paired && !$disconnected) ? &lg_webos_reachable_cached($probe_ip) : 0;
- my $connected=($paired && !$disconnected && $reachable) ? 1 : 0;
+ my $connect_failed=($clients->{"connect_failed_at"}||"") ne "" ? 1 : 0;
+ my $connected=($paired && !$disconnected && $reachable && !$connect_failed) ? 1 : 0;
  my $supported=($detected || $paired || $stored_ip ne "" || $manual_ip ne "" || $auto_ip ne "") ? 1 : 0;
  my $detection_source=$auto_ip ne "" ? ($auto->{"source"}||"mdns-hostname") : ($detected ? ($cec_tv_vendor ne "" ? "cec-vendor" : "cec-osd-name") : "manual-only");
  my $message=$message_override;
@@ -1719,6 +1724,10 @@ sub lg_status_data (@) {
     } elsif($paired && !$reachable) {
      my $tv=($stored_name ne "") ? $stored_name : "The paired LG TV";
      $message="$tv is not answering at $probe_ip on ports 3000/3001. Turn the TV on, then click Connect.";
+    } elsif($paired && $connect_failed) {
+     my $tv=($stored_name ne "") ? $stored_name : "the paired LG TV";
+     my $why=($last_error ne "") ? ": $last_error" : "";
+     $message="The last connection to $tv failed$why. Click Connect to retry.";
     } elsif($paired && $stored_name ne "") {
      $message="Stored LG WebOS pairing is ready for $stored_name. Click Connect to reconnect or refresh TV info.";
   } elsif($paired) {
@@ -1745,6 +1754,7 @@ sub lg_status_data (@) {
   detection_source => $detection_source,
   paired => &lg_json_bool($paired),
   reachable => &lg_json_bool($reachable),
+  connect_failed => &lg_json_bool($connect_failed),
   connected => &lg_json_bool($connected),
   disconnected => &lg_json_bool($disconnected),
       pair_prompted => $pin_pending ? &lg_json_true() : &lg_json_false(),
