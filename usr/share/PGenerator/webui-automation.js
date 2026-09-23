@@ -4,7 +4,7 @@ var pgAutomation = {
  supportedKeys:[],supportedValues:{},pinnedKeys:[],supportedSignal:'',supportedPictureMode:'',
  editorTarget:'queue',editingQueueIndex:null,editingRecipe:null,editorEpoch:0,
  editorSettingsKey:'',editorSettingsDrafts:{},fillingEditor:false,gammaFollowsTarget:false,
- editingRunId:'',firstPending:0,busy:false,polling:false,tab:'queue',
+ editingRunId:'',firstPending:0,editChecked:'',editChecking:'',busy:false,polling:false,tab:'queue',
  jobViews:{},followLive:true,liveSelection:null,logFollow:true,logNotices:[],logObserved:[]
 };
 const PG_AUTOMATION_SERIES=[['Grey','greyscale-21','Greyscale'],['Colors','colors-30','ColorChecker'],['Sats','saturations-24','Saturation']];
@@ -1592,7 +1592,46 @@ async function pgAutomationEditActiveQueue(){
  try{
   const result=await pgAutomationRequest('runs/'+encodeURIComponent(pgAutomation.editingRunId)+'/edit',{first_pending:pgAutomation.firstPending,items:pgAutomation.queue.items.slice(pgAutomation.firstPending)});
   pgAutomationNotice(result.warning?'Pending changes saved. '+result.warning:'Pending changes saved',result.warning?'warning':false);await pgAutomationPollLive();
- }catch(e){pgAutomationNotice(e.message+' Reload pending items if the batch has advanced.',true);}
+ }catch(e){
+  pgAutomationNotice(e.message+' Reload pending items if the batch has advanced.',true);
+  pgAutomation.editChecked='';await pgAutomationCheckEditBinding(pgAutomationCurrentRun());
+ }
+}
+// Pending edits bind the draft to one run, and the binding is saved with the
+// draft. Once that run has ended or been deleted it can never take the edit,
+// yet the binding hid Run queue and refused new queues, even after a reload.
+// Mirrors webui_automation_active_status: stopping/completing are left alone
+// because they settle on their own.
+const PG_AUTOMATION_ACTIVE_STATUSES=['starting','running','paused','stopping','completing','interrupted'];
+function pgAutomationReleaseEdit(reason){
+ if(!pgAutomation.editingRunId)return;
+ const ran=pgAutomation.firstPending;
+ pgAutomation.queue={...pgAutomation.queue,name:pgAutomationQueueName(pgAutomation.queue.name),items:pgAutomation.queue.items.map(pgAutomationSnapshot)};
+ pgAutomation.editingRunId='';pgAutomation.firstPending=0;pgAutomation.editChecked='';pgAutomation.selectedQueue='';pgAutomation.loadedQueueSnapshot='';
+ pgAutomationSaveDraft();pgAutomationRenderSavedQueues();pgAutomationRenderQueue();
+ pgAutomationNotice('The run these jobs belonged to '+reason+'; they are now an ordinary unsaved draft.'+(ran>0?' The first '+(ran===1?'job':ran+' jobs')+' already ran in that batch; remove '+(ran===1?'it':'them')+' if you do not want to run '+(ran===1?'it':'them')+' again.':'')+' Nothing has started.','warning');
+}
+// Checks the run the draft is bound to. Only a definite answer releases it:
+// a failed or slow request keeps the binding and retries on the next poll.
+async function pgAutomationCheckEditBinding(current){
+ const id=pgAutomation.editingRunId;
+ if(!id||pgAutomation.editChecking===id)return;
+ if(current?.id===id){
+  if(!PG_AUTOMATION_ACTIVE_STATUSES.includes(current.status))pgAutomationReleaseEdit('has ended ('+String(current.status||'finished').replace(/-/g,' ')+')');
+  return;
+ }
+ // A run that is not current cannot advance, so one confirmed answer holds.
+ if(pgAutomation.editChecked===id)return;
+ pgAutomation.editChecking=id;
+ try{
+  const result=await fetchJSON('/api/automation/runs/'+encodeURIComponent(id),{_quiet:true,_timeoutMs:30000});
+  if(pgAutomation.editingRunId!==id)return;
+  if(result?.run){
+   if(PG_AUTOMATION_ACTIVE_STATUSES.includes(result.run.status))pgAutomation.editChecked=id;
+   else pgAutomationReleaseEdit('has ended ('+String(result.run.status||'finished').replace(/-/g,' ')+')');
+  }else if(result?.error_code==='not-found')pgAutomationReleaseEdit('no longer exists on the generator');
+ }catch(e){}
+ finally{if(pgAutomation.editChecking===id)pgAutomation.editChecking='';}
 }
 function pgAutomationRenderLiveRun(run,execution){
  pgAutomationSyncCalibrationView(run);
@@ -1704,6 +1743,7 @@ async function pgAutomationPollLive(){
    pgAutomation.pollMisses=0;pgAutomation.pollDelayed=false;
    pgAutomation.statusError='';pgAutomation.receivedAt=Date.now()/1000;pgAutomation.current=result;pgAutomationRenderLiveRun(result.run,result.execution);
    pgAutomationSyncLiveMark();
+   if(pgAutomation.editingRunId)pgAutomationCheckEditBinding(result.run);
   }
   else pgAutomationPollMissed('Cannot refresh run status. Showing the last known state; progress is unconfirmed. Do not start another run.');
  }catch(e){pgAutomationPollMissed('Run status connection failed: '+e.message+'. Showing the last known state.');
