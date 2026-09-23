@@ -13791,7 +13791,9 @@ sub lg_autocal_26_build_sdr26_1d_dpg_seeded {
 # helper. Both the measured and the target XYZ are projected to linear
 # Display-P3 RGB using the D65 matrix below; per-channel gains are the
 # target/measured ratio, clamped to [0.5, 2.0] for per-iteration safety
-# and replaced with 1.0 on any NaN/inf/non-positive input. Pure math,
+# and replaced with 1.0 on any NaN/inf/non-positive input -- except a
+# channel projecting to <= 0 while Y and another channel are valid, which
+# was read below the meter floor and gets the 2.0 ceiling. Pure math,
 # no I/O, no global state.
 sub lg_autocal_26_hdr20_dpg_gain {
 	 my ($reading,$target_luminance,$target_x,$target_y,$ire)=@_;
@@ -13832,6 +13834,7 @@ sub lg_autocal_26_hdr20_dpg_gain {
 	  0.0358458*$tX + -0.0761724*$tY +  0.9568845*$tZ,
 	 );
 	 my @gain;
+	 my $any_measurable=grep { $_+0 > 0 } @mrgb;
 	 for my $ch (0..2) {
 	  my $m=$mrgb[$ch];
 	  my $t=$trgb[$ch];
@@ -13850,6 +13853,10 @@ sub lg_autocal_26_hdr20_dpg_gain {
 	   # those codes when the DPG is allowed to adjust.
 	   $g=2.0 if($g+0 > 2.0);
 	   $g=1.0 if($g+0 != $g+0);
+	  } elsif($m+0 == $m+0 && $t+0 == $t+0 && $t+0 > 0 && $any_measurable) {
+	   # Channel below the meter floor under a valid Y: ceiling gain, not
+	   # 1.0. Same reasoning as lg_autocal_26_sdr26_dpg_gain below.
+	   $g=2.0;
 	  }
 	  push @gain,$g+0;
 	 }
@@ -13908,6 +13915,7 @@ sub lg_autocal_26_sdr26_dpg_gain {
 	  0.0556434*$tX + -0.2040259*$tY +  1.0572252*$tZ,
 	 );
 	 my @gain;
+	 my $any_measurable=grep { $_+0 > 0 } @mrgb;
 	 for my $ch (0..2) {
 	  my $m=$mrgb[$ch];
 	  my $t=$trgb[$ch];
@@ -13921,6 +13929,17 @@ sub lg_autocal_26_sdr26_dpg_gain {
 	   $g=0.5 if($g+0 < 0.5);
 	   $g=2.0 if($g+0 > 2.0);
 	   $g=1.0 if($g+0 != $g+0);
+	  } elsif($m+0 == $m+0 && $t+0 == $t+0 && $t+0 > 0 && $any_measurable) {
+	   # Y is valid and another channel is measurable, but this one projects
+	   # to <= 0: the meter read it below its floor. Near black an i1Display
+	   # Pro sensor can return zero counts, which leaves a fixed-ratio XYZ
+	   # with that primary missing (LG C1 SDR 2%: B/Y -0.15 on every such
+	   # read). Holding the gain at 1.0 deadlocks the anchor: the channel
+	   # never rises into the meter's range, and raising only the other two
+	   # to reach target Y worsens the measured color, so every move is
+	   # reverted. The ceiling lets the damp raise it ~1.25x per iteration
+	   # until the meter resolves it, after which the ratio above applies.
+	   $g=2.0;
 	  }
 	  push @gain,$g+0;
 	 }
