@@ -39,44 +39,53 @@ is(main::autocal_dpg_meter_floor({lg_autocal_sdr26_dpg_meter_floor=>0},"sdr"),0.
 my $step_nb={name=>"sdr26_2.3%",ire=>2.3};
 # All guards satisfied: deepest near-black, meter proven, sub-floor target,
 # unmeasurable-sample class.
-ok(main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,0.0117,$UNMEASURABLE,1),
+ok(main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,0.0035,$UNMEASURABLE,1),
    'skips a deepest near-black, sub-floor, unmeasurable patch once the meter is proven');
 # Guard 1: meter not yet proven this pass.
-ok(!main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,0.0117,$UNMEASURABLE,0),
+ok(!main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,0.0035,$UNMEASURABLE,0),
    'never skips before any valid read has proven the meter');
 # Guard 2: IRE above the deepest near-black cap.
-ok(!main::autocal_nearblack_unmeasurable_skip({},"sdr",{name=>"5%",ire=>5},0.0117,$UNMEASURABLE,1),
+ok(!main::autocal_nearblack_unmeasurable_skip({},"sdr",{name=>"5%",ire=>5},0.0035,$UNMEASURABLE,1),
    'never skips a mid/low patch above the near-black IRE cap');
 # Guard 3: expected luminance well above the meter floor.
 ok(!main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,0.05,$UNMEASURABLE,1),
    'never skips when the expected target sits above the meter floor margin');
+# The default margin is 2x the floor. At a 100-nit SDR white the 2.3% target is
+# ~0.0117-0.014 cd/m2, which the C1 measured and converged once the renderer
+# showed the requested code -- so that patch is readable and must never be
+# written off as sub-floor. Only a dim reference puts it near the floor (0.0035
+# above is 2.3% at a ~30-nit white).
+ok(!main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,0.0117,$UNMEASURABLE,1),
+   'a 2.3% patch at a 100-nit white (target 0.0117) is readable and is not skipped at the default margin');
+ok(!main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,0.0061,$UNMEASURABLE,1),
+   'the default margin stops at 2x the 0.003 floor');
 # Guard 4: cancellation and non-measurement errors are never sub-floor skips.
-ok(!main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,0.0117,"Auto Cal cancelled",1),
+ok(!main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,0.0035,"Auto Cal cancelled",1),
    'never skips a cancellation');
-ok(!main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,0.0117,"SDR26 1D DPG upload failed",1),
+ok(!main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,0.0035,"SDR26 1D DPG upload failed",1),
    'never skips an upload/endpoint failure');
-ok(!main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,0.0117,"",1),
+ok(!main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,0.0035,"",1),
    'never skips with an empty reason');
 ok(!main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,undef,$UNMEASURABLE,1),
    'never skips when the expected luminance is unknown');
 # Config knobs.
-ok(!main::autocal_nearblack_unmeasurable_skip({lg_autocal_sdr26_dpg_nearblack_skip_max_ire=>0},"sdr",$step_nb,0.0117,$UNMEASURABLE,1),
+ok(!main::autocal_nearblack_unmeasurable_skip({lg_autocal_sdr26_dpg_nearblack_skip_max_ire=>0},"sdr",$step_nb,0.0035,$UNMEASURABLE,1),
    'an operator can disable the skip by setting the IRE cap to 0');
 ok(main::autocal_nearblack_unmeasurable_skip({lg_autocal_sdr26_dpg_nearblack_skip_floor_margin=>100},"sdr",$step_nb,0.05,$UNMEASURABLE,1),
    'a wider floor margin lets a slightly brighter near-black patch skip');
 # HDR20 uses the same gate.
-ok(main::autocal_nearblack_unmeasurable_skip({},"hdr20",$step_nb,0.0117,"No usable meter measurement for 2.3% after 4 sample attempts",1),
+ok(main::autocal_nearblack_unmeasurable_skip({},"hdr20",$step_nb,0.0035,"No usable meter measurement for 2.3% after 4 sample attempts",1),
    'HDR20 honours the same near-black skip gate');
 # Guard 4b: the low-shadow ladder returns the SAME prefix whether the samples
 # were valid-but-sub-floor (clean, no suffix -> skippable) or the ladder was
 # exhausted by an underlying meter/comms/signal error (which it appends after
 # "meter alignment"). A suffix means a real fault drove the failure -> abort.
 my $CLEAN="No usable meter measurement for sdr26_2.3% after 4 sample attempts; check the signal range, displayed patch and meter alignment";
-ok(main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,0.0117,$CLEAN,1),
+ok(main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,0.0035,$CLEAN,1),
    'skips the CLEAN ladder-exhaustion message (valid-but-sub-floor samples)');
-ok(!main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,0.0117,$CLEAN.": spotread communication timeout",1),
+ok(!main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,0.0035,$CLEAN.": spotread communication timeout",1),
    'never skips when the ladder appended a transient meter/comms error');
-ok(!main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,0.0117,$CLEAN.": Pattern rejected",1),
+ok(!main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,0.0035,$CLEAN.": Pattern rejected",1),
    'never skips when the ladder appended a hard (non-transient) read error');
 
 # ---------------------------------------------------------------------------
@@ -85,7 +94,7 @@ ok(!main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,0.0117,$CLEAN.":
 # ---------------------------------------------------------------------------
 for my $prefix (qw(sdr hdr20)) {
  my $state={};
- my $marker=eval { main::autocal_dpg_read_failure_or_skip($state,{},$prefix,$step_nb,21,"sdr26_2.3%",0.0117,$UNMEASURABLE,1); 1 };
+ my $marker=eval { main::autocal_dpg_read_failure_or_skip($state,{},$prefix,$step_nb,21,"sdr26_2.3%",0.0035,$UNMEASURABLE,1); 1 };
  ok(!$marker,"$prefix near-black skip throws rather than returning");
  ok(main::autocal_nearblack_skip_marker($@),"$prefix throws the skip SENTINEL (a ref), not a fatal string");
  is(ref($state->{"${prefix}_1d_dpg_skipped_anchors"}),"ARRAY","$prefix records the skipped anchor list");
@@ -141,7 +150,9 @@ sub run_sdr26 {
    $gone_unmeasurable=1;
    return (undef,"No usable meter measurement for ".($rs->{name}||"patch")." after 4 sample attempts".$clean.$suffix);
   }
-  my $y=($ire/100.0)**2.4*100.0; $y=0.0005 if($y<=0);
+  # A dim ~30-nit white: the only regime where the 2.3% target (~0.0035) sits
+  # within the default 2x margin of the meter floor.
+  my $y=($ire/100.0)**2.4*30.0; $y=0.0005 if($y<=0);
   # A panel that already measures exactly on target converges on iteration 1 and
   # never rebuilds the curve, which hides anything wrong with the anchor list.
   # Read each patch 25% high ONCE so every anchor actually computes a
@@ -164,7 +175,7 @@ sub run_sdr26 {
   max_bpc=>10, pattern_signal_range=>2, signal_range=>2, transport_signal_range=>2,
   color_format=>0, lg_autocal_26=>1, black_y=>0, target_delta_e=>0.5 };
  my ($err,$died);
- { local $@; $err=eval { main::lg_autocal_26_run_sdr_1d_dpg_greyscale($config,$state,100,0.3127,0.329,'filmMaker') }; $died=$@; }
+ { local $@; $err=eval { main::lg_autocal_26_run_sdr_1d_dpg_greyscale($config,$state,30,0.3127,0.329,'filmMaker') }; $died=$@; }
  return ($err,$died,$state);
 }
 
@@ -243,10 +254,10 @@ sub run_sdr26 {
 
 # ---------------------------------------------------------------------------
 # 4b. The HDR20 solver's skip handler, via the existing single-anchor test mode.
-#     The 1% HDR20 anchor at a 600-nit reference targets ~0.024 nits -- genuinely
-#     below the meter floor margin, which is the physical case this feature
-#     exists for. (At a 1000-nit reference even 1% targets ~0.040 nits and is
-#     correctly NOT skippable, so the reference has to be a dim one.)
+#     The 1% HDR20 anchor at a 100-nit reference targets ~0.0040 nits, within
+#     the default 2x margin of the 0.003 floor. At 600 nits it targets ~0.024 and
+#     at 1000 nits ~0.040, both readable and correctly NOT skippable, so the
+#     reference has to be a dim one.
 # ---------------------------------------------------------------------------
 sub run_hdr20 {
  my (%opt)=@_;
@@ -274,9 +285,9 @@ sub run_hdr20 {
  my ($err,$died);
  { local $@; $err=eval { main::lg_autocal_26_run_hdr20_dpg_greyscale({
     signal_mode=>'hdr10', target_delta_e=>0.5,
-    hdr20_test_anchor_ire=>1, hdr20_test_snapshot_dpg=>\@dpg, hdr20_test_white_ref=>600,
+    hdr20_test_anchor_ire=>1, hdr20_test_snapshot_dpg=>\@dpg, hdr20_test_white_ref=>100,
     steps=>[{name=>'1%',ire=>1,stimulus=>1,ddc_layout=>'hdr20',r=>41,g=>41,b=>41,input_max=>4095}],
-   },$state,600,0.3127,0.329,'dolbyVisionFilmMaker') }; $died=$@; }
+   },$state,100,0.3127,0.329,'dolbyVisionFilmMaker') }; $died=$@; }
  return ($err,$died,$state);
 }
 {
@@ -326,10 +337,21 @@ sub run_hdr20 {
  is(main::autocal_dpg_anchor_unresponsive([{y=>0.0100,lut=>[1000,1000,1000]},{y=>0.0180,lut=>[1300,1000,1000]},{y=>0.0101,lut=>[1000,1000,1000]}]),undef,
   'a move that was reverted is not a flat response (the LUT is the same again)');
 
- ok(!main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,0.0117,$UNMEASURABLE,1,$why),
+ # sdr26_2% on the C1 after #30, straight from the run log: the panel output is
+ # quantized near black, so reads alternate between two exact levels. The solver
+ # restored near its best between moves, so no flat pair spans a 10% move.
+ my $c1_two=[{y=>0.0057,lut=>[608,608,608]},{y=>0.0108,lut=>[721,760,608]},
+  {y=>0.0057,lut=>[598,600,608]},{y=>0.0100,lut=>[711,750,608]}];
+ is(main::autocal_dpg_anchor_unresponsive($c1_two),undef,'the real quantized 2% sequence is responsive');
+ # The same quantization CAN put two LUT values >10% apart on one output step.
+ # A pair that responded elsewhere must still clear the patch.
+ is(main::autocal_dpg_anchor_unresponsive([{y=>0.0057,lut=>[608,608,608]},{y=>0.0108,lut=>[721,760,608]},{y=>0.0057,lut=>[680,690,608]}]),undef,
+  'one responsive pair clears the patch even when another pair lands on the same quantized step');
+
+ ok(!main::autocal_nearblack_unmeasurable_skip({},"sdr",$step_nb,0.0035,$UNMEASURABLE,1,$why),
   'guard 5: an otherwise-skippable patch is NOT skipped once it has shown a flat response');
  my $state={};
- eval { main::autocal_dpg_read_failure_or_skip($state,{},"sdr",$step_nb,21,"sdr26_2.3%",0.0117,$UNMEASURABLE,1,$why) };
+ eval { main::autocal_dpg_read_failure_or_skip($state,{},"sdr",$step_nb,21,"sdr26_2.3%",0.0035,$UNMEASURABLE,1,$why) };
  ok(!main::autocal_nearblack_skip_marker($@),'the router aborts instead of throwing the skip sentinel');
  like($@,qr/measurement failed at sdr26_2\.3%.*did not respond to a LUT change/,'and the abort names the flat response, which points at the renderer, not the meter');
  ok(!$state->{sdr_1d_dpg_skipped_anchors},'nothing is recorded as carried forward');

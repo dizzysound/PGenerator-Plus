@@ -3423,10 +3423,14 @@ sub autocal_dpg_note_anchor_read {
 }
 
 # Positive evidence that the patch is not receiving the code the solver adjusts:
-# two valid reads straddling an accepted LUT move of at least 10% whose
-# luminance moved less than 5%. Returns a description for the log and the
-# fatal message, or undef when the reads are consistent with a responsive patch
-# or are too few to judge -- absence of evidence never blocks a skip.
+# every pair of valid reads straddling a LUT move of at least 10% moved less
+# than 5% in luminance, and there is at least one such pair. A single pair that
+# did respond clears the patch: near black the panel's output is quantized, so
+# two LUT values can land on the same output step (seen at sdr26_2% on the C1,
+# which alternated between exactly 0.0057 and 0.0108 cd/m2) while other moves
+# plainly change the light. Returns a description for the log and the fatal
+# message, or undef when the patch responded or there is too little evidence --
+# absence of evidence never blocks a skip.
 #
 # A genuinely sub-floor patch whose valid reads sit pinned at the meter's
 # quantization floor is also caught here and aborts. That is deliberate: a
@@ -3435,6 +3439,7 @@ sub autocal_dpg_note_anchor_read {
 sub autocal_dpg_anchor_unresponsive {
  my ($history)=@_;
  return undef if(ref($history) ne "ARRAY" || @{$history} < 2);
+ my $flat;
  for my $i (0..$#{$history}-1) {
   for my $j ($i+1..$#{$history}) {
    my ($first,$later)=($history->[$i],$history->[$j]);
@@ -3448,12 +3453,16 @@ sub autocal_dpg_anchor_unresponsive {
    next if($move < $AUTOCAL_DPG_RESPONSE_MIN_LUT_MOVE);
    my $ymax=($first->{"y"} > $later->{"y"}) ? $first->{"y"} : $later->{"y"};
    my $yrel=($ymax > 0) ? abs($later->{"y"}-$first->{"y"})/$ymax : 0;
-   next if($yrel >= $AUTOCAL_DPG_RESPONSE_MAX_FLAT_Y);
-   return sprintf("valid reads did not respond to a LUT change: Y %.4f -> %.4f cd/m2 (%.1f%%) while %s moved %d -> %d (%.0f%%)",
-    $first->{"y"},$later->{"y"},$yrel*100,('R','G','B')[$ch],$first->{"lut"}[$ch],$later->{"lut"}[$ch],$move*100);
+   # Any real response settles it: the panel is showing the corrected code.
+   return undef if($yrel >= $AUTOCAL_DPG_RESPONSE_MAX_FLAT_Y);
+   # Keep the largest flat move as the one to report.
+   $flat=[$first,$later,$yrel,$move,$ch] if(!$flat || $move > $flat->[3]);
   }
  }
- return undef;
+ return undef if(!$flat);
+ my ($first,$later,$yrel,$move,$ch)=@{$flat};
+ return sprintf("valid reads did not respond to a LUT change: Y %.4f -> %.4f cd/m2 (%.1f%%) while %s moved %d -> %d (%.0f%%)",
+  $first->{"y"},$later->{"y"},$yrel*100,('R','G','B')[$ch],$first->{"lut"}[$ch],$later->{"lut"}[$ch],$move*100);
 }
 
 # A deepest near-black patch can emit light below the colorimeter's usable
@@ -3477,9 +3486,9 @@ sub autocal_dpg_anchor_unresponsive {
 #   2. the patch is a deepest near-black anchor -- IRE at/below the skip cap
 #      (default 2.5, matching the protected_noise_floor boundary);
 #   3. the patch is physically expected at/below the meter floor -- its target
-#      luminance <= meter_floor * margin. This is true in the dark-white regime
-#      the failure occurs in, and false for a bright calibration where an
-#      unreadable near-black patch is far more likely a real fault;
+#      luminance <= meter_floor * margin (default 2x). This is true only for a
+#      dim reference; at a normal SDR white an unreadable near-black patch is
+#      far more likely a real fault;
 #   4. the failure is the "no usable measurement" class, never a cancellation
 #      or an upload/endpoint error;
 #   5. the patch has not shown it is unresponsive ($unresponsive): valid reads
@@ -3515,7 +3524,11 @@ sub autocal_nearblack_unmeasurable_skip {
  return 0 if(!defined($expected_lum) || $expected_lum < 0);
  my $floor=autocal_dpg_meter_floor($config,$prefix);
  my $margin_key=($prefix eq "hdr20") ? "lg_autocal_hdr20_dpg_nearblack_skip_floor_margin" : "lg_autocal_sdr26_dpg_nearblack_skip_floor_margin";
- my $margin=(defined($config->{$margin_key}) && $config->{$margin_key} ne "") ? ($config->{$margin_key}+0) : 10.0;
+ # 2x the floor, not 10x. On the C1 with the renderer precision fix, the 2.3%
+ # and 2% SDR patches (targets 0.014 and 0.011 cd/m2) measured and converged,
+ # and the meter returned valid reads down to 0.0057; a 10x margin (0.03) let
+ # those demonstrably readable patches be written off as below the floor.
+ my $margin=(defined($config->{$margin_key}) && $config->{$margin_key} ne "") ? ($config->{$margin_key}+0) : 2.0;
  $margin=1.0 if($margin < 1.0);
  $margin=1000.0 if($margin > 1000.0);
  return 0 if($expected_lum > $floor*$margin);
