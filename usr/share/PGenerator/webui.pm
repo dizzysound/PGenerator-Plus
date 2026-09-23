@@ -18,6 +18,7 @@ BEGIN {
  unshift @INC,$module_dir if($module_dir ne "" && !grep { $_ eq $module_dir } @INC);
 }
 use PGMath ();
+use PGIdleCard ();
 use PGCalibrationMath qw(
  calibration_target_context saturation_stimulus_for_gamuts standard_gamut_records
 );
@@ -27,6 +28,7 @@ use PGSignalCode qw(
 use PGLGCapabilities qw(lg_recipe lg_setting_contracts lg_setting_values_agree lg_normalize_setting_value lg_operation_contract lg_best_settings_plan lg_settings_selection_plan lg_calibration_mode_contract lg_picture_mode_read_forbidden);
 use Fcntl qw(O_NONBLOCK O_WRONLY LOCK_EX LOCK_UN);
 use File::Path qw(make_path);
+use File::Temp ();
 use JSON::PP ();
 use PGAutomation ();
 use PGCalibrationLog ();
@@ -1326,7 +1328,17 @@ sub webui_http_worker (@) {
   : ($lane eq "meter") ? $_webui_meter_queue
   : ($lane eq "renderer") ? $_webui_renderer_queue
   : $_webui_worker_queue;
- while(defined(my $entry=$queue->dequeue())) {
+ # The renderer lane owns the idle card timer: it runs between requests, so
+ # the card is serialised with every other pattern write on this lane.
+ my $idle_timer=($lane eq "renderer") ? 1 : 0;
+ srand(int(Time::HiRes::time()*1000) ^ $$ ^ threads->tid()) if($idle_timer);
+ while(1) {
+  my $entry=$idle_timer ? $queue->dequeue_timed(1) : $queue->dequeue();
+  if(!defined($entry)) {
+   last if(!$idle_timer);
+   eval { &webui_idle_card_tick(); 1; } or &log("WebUI: idle card check failed: ".($@||"unknown error"));
+   next;
+  }
   my $record=&webui_route_queue_entry($entry);
   if(ref($record) ne "HASH") {
    &log("WebUI: worker $worker_id discarded malformed queue entry");
@@ -1932,6 +1944,21 @@ sub webui_handle_request (@) {
     $result=&webui_pattern($body) if($result eq "");
     my $len=length($result);
     print $client "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: $len\r\n$cors\r\n$result";
+   }
+   elsif($path eq "/api/idle-card" && $method eq "GET") {
+    my $result=&webui_idle_card_status_json();
+    my $len=length($result);
+    print $client "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: $len\r\n$cors\r\n$result";
+   }
+   elsif($path eq "/api/idle-card/preview.png" && $method eq "GET") {
+    my ($png,$error)=&webui_idle_card_preview_png();
+    if(defined($png)) {
+     print $client "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nCache-Control: no-store\r\nContent-Length: ".length($png)."\r\n$cors\r\n";
+     print $client $png;
+    } else {
+     my $result='{"status":"error","message":"'.&_webui_json_escape($error).'"}';
+     print $client "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: ".length($result)."\r\n$cors\r\n$result";
+    }
    }
    elsif($path eq "/api/update/check") {
     # Allow more time here: the first check after boot may need DNS/TLS setup
@@ -12359,16 +12386,450 @@ sub webui_meter_stabilization_code (@) {
 
 sub webui_pattern_idle_refresh_allowed (@) {
  return (1,"") if(!-f $command_file);
- my $current="";
+ my $current=&webui_pattern_file_idle_name();
+ return (1,$current) if($current eq "" || $current eq "stop" || $current eq "stabilization" || $current eq "screensaver");
+ return (0,$current);
+}
+
+# PATTERN_NAME of the command file, with the renderer's start-up frame
+# reported as "stop" when it is black: every renderer start (boot and each
+# settings apply) writes PatternStart, and that black frame is the idle state.
+sub webui_pattern_file_idle_name (@) {
+ my $name="";
+ my $rgb="";
+ my $has_content=0;
  if(open(my $fh,"<",$command_file)) {
   while(my $line=<$fh>) {
-   if($line=~/^PATTERN_NAME=(.*)$/) { $current=$1; last; }
+   $has_content=1 if($line=~/\S/);
+   $name=$1 if($name eq "" && $line=~/^PATTERN_NAME=(.*)$/);
+   $rgb=$1 if($rgb eq "" && $line=~/^RGB=(.*)$/);
   }
   close($fh);
+ } elsif(-e $command_file) {
+  return "unknown";
  }
- $current=~s/[\r\n]+//g;
- return (1,$current) if($current eq "" || $current eq "stop" || $current eq "stabilization");
- return (0,$current);
+ $name=~s/[\r\n]+//g;
+ $rgb=~s/[\r\n\s]+//g;
+ return "stop" if($name eq $pattern_start && $rgb=~/^0,0,0$/);
+ # Calman CommandRGB and Resolve can write a complete patch without a name.
+ # Only an empty file is idle; even an unnamed black patch belongs to its client.
+ return "unknown" if($name eq "" && $has_content);
+ return $name;
+}
+
+sub webui_pattern_file_signature (@) {
+ my @st=Time::HiRes::stat($command_file);
+ return @st ? join(":",@st[0,1,7,9,10]) : "";
+}
+
+###############################################
+#            Idle Information Card            #
+###############################################
+# While nothing owns the display and it has sat at the black idle frame for
+# the configured delay, show a dim card describing the HDMI signal: what the
+# Output settings request beside what the driver is sending. The renderer
+# lane runs the check between requests, so the card is serialised with every
+# other /api/pattern write and a patch always wins the race.
+our $_idle_card_status :shared = "";
+# Renderer-lane state only: the timer and /api/pattern run on that one worker.
+# Other lanes read the shared JSON snapshot, never this nested mutable hash.
+our %_idle_card=();
+our $IDLE_CARD_REFRESH_S=60;
+our $IDLE_CARD_BLOCKED_RECHECK_S=5;
+our $IDLE_CARD_FAILURE_BACKOFF_S=60;
+
+sub webui_idle_card_font_dir (@) {
+ my $dir=__FILE__;
+ $dir=~s{/[^/]+\z}{};
+ foreach my $candidate (($dir ne "" ? "$dir/fonts" : ()),"/usr/share/PGenerator/fonts") {
+  return $candidate if(-f "$candidate/DejaVuSans.ttf" && -f "$candidate/DejaVuSans-Bold.ttf");
+ }
+ return "";
+}
+
+sub webui_idle_card_settings (@) {
+ my $enabled=$pgenerator_conf{"screensaver_enabled"};
+ $enabled=(!defined($enabled) || $enabled eq "" || $enabled ne "0") ? 1 : 0;
+ my $delay=$pgenerator_conf{"screensaver_delay_s"};
+ $delay=30 if(!defined($delay) || $delay !~ /^\d+$/);
+ $delay=int($delay);
+ $delay=10 if($delay < 10);
+ $delay=3600 if($delay > 3600);
+ return ($enabled,$delay);
+}
+
+sub webui_idle_card_now (@) {
+ my $now=eval { Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC()) };
+ return defined($now) ? $now : Time::HiRes::time();
+}
+
+# Who holds the display, without the guard's logging. Shared by the pattern
+# guard and the idle card so both apply the same ownership rules.
+sub webui_display_owner (@) {
+ my $owner="";
+ my $execution=&webui_automation_read_execution();
+ $owner="automation" if(ref($execution) eq "HASH" && &webui_automation_active_status($execution->{status}));
+ $owner||="LG Auto Cal" if(&webui_meter_lg_autocal_running());
+ $owner||="3D LUT calibration" if(&webui_meter_lg_3d_autocal_running());
+ $owner||="Dolby Vision profiling" if(&webui_meter_lg_dv_profile_running());
+ $owner||="measurement series" if(&webui_meter_series_alive());
+ if(!$owner && &webui_meter_session_alive()) {
+  my $read=PGAutomation::read_json_file($_meter_read_file)||{};
+  $owner="meter reading" if(($read->{status}||"")=~/^(?:starting|measuring|running)$/);
+ }
+ return $owner;
+}
+
+# USB ids of attached meters, straight from sysfs: no spotread probe, which
+# could claim an instrument another tool is about to open.
+sub webui_idle_card_usb_meters (@) {
+ my @found;
+ foreach my $dir (glob("/sys/bus/usb/devices/*")) {
+  next if(!-f "$dir/idVendor" || !-f "$dir/idProduct");
+  my $vendor=&read_from_file("$dir/idVendor");
+  my $product=&read_from_file("$dir/idProduct");
+  $vendor=~s/\s+//g;
+  $product=~s/\s+//g;
+  my $name=PGIdleCard::meter_name_for_usb_id("$vendor:$product");
+  push @found,$name if($name ne "");
+ }
+ return @found;
+}
+
+# Stabilisation takes the idle slot whenever it would be active; the meter's
+# presence is taken from USB so the check never starts a probe.
+sub webui_idle_card_stabilization_wanted (@) {
+ my ($enabled)=&webui_meter_stabilization_settings();
+ return 0 if(!$enabled);
+ return (&webui_idle_card_usb_meters()) ? 1 : 0;
+}
+
+sub webui_idle_card_video_playing (@) {
+ my $pids=`pgrep -x omxplayer.bin 2>/dev/null; pgrep -x pg_diag_video_player 2>/dev/null`;
+ return ($pids=~/\d/) ? 1 : 0;
+}
+
+# Everything the "Sent" column needs: the connector state from modetest, the
+# live CRTC timing from debugfs and the encoder's infoframe slots.
+sub webui_idle_card_readback (@) {
+ # Atomic listing first: the Pi 5 kernel hides "output format" from legacy
+ # clients. Older modetest builds reject -a and print nothing.
+ my $text=`timeout 4 $modetest -a -c 2>/dev/null`;
+ $text=`timeout 4 $modetest -c 2>/dev/null` if($text!~/\bprops:/);
+ my $connectors=PGIdleCard::parse_modetest_connectors($text);
+ # Prefer the configured port; fall back to whichever HDMI port has a sink.
+ my @connected=grep { /^HDMI/ && ($connectors->{$_}{status}||"") eq "connected" } sort keys %$connectors;
+ my ($name)=grep { $_ eq ($hdmi_1||"") || $_ eq ($hdmi_2||"") } @connected;
+ $name=$connected[0] if(!defined($name));
+ my ($mode,$packets);
+ foreach my $dir (sort glob("/sys/kernel/debug/dri/*")) {
+  next if(!-r "$dir/state");
+  $mode=PGIdleCard::parse_debugfs_active_mode(&read_from_file("$dir/state"));
+  next if(!$mode);
+  my $regs="$dir/hdmi".((defined($name) && $name=~/-2$/) ? 1 : 0)."_regs";
+  $packets=PGIdleCard::parse_hdmi_packet_config(&read_from_file($regs)) if(-r $regs);
+  last;
+ }
+ return (mode=>$mode,connector=>(defined($name) ? $connectors->{$name} : undef),packets=>$packets);
+}
+
+sub webui_idle_card_kit (@) {
+ # Wired address first: it is the one a calibration PC is most likely to use.
+ my %kit;
+ my $ip="";
+ my %by_iface;
+ foreach my $line (split(/\n/,`ip -o -4 addr show scope global 2>/dev/null`)) {
+  $by_iface{$1}=$2 if($line=~/^\d+:\s+(\S+)\s+inet\s+(\d+\.\d+\.\d+\.\d+)\//);
+ }
+ foreach my $iface ("eth0","wlan0",sort keys %by_iface) {
+  if($by_iface{$iface}) { $ip=$by_iface{$iface}; last; }
+ }
+ $kit{generator}="PGenerator+ $version".($ip ne "" ? " at $ip" : "");
+ my $clients=eval { &lg_load_clients() } || {};
+ if(ref($clients) eq "HASH" && ($clients->{model_name} || $clients->{name})) {
+  my $tv="LG ".($clients->{model_name} || $clients->{name});
+  my $mode=PGIdleCard::picture_mode_label($clients->{last_written_picture_mode});
+  $tv.=", $mode" if($mode ne "");
+  $kit{tv}="$tv (last known)";
+ }
+ my @meters=&webui_idle_card_usb_meters();
+ $kit{meter}=@meters ? join(", ",@meters) : "None connected";
+ return \%kit;
+}
+
+sub webui_idle_card_model (@) {
+ # $hdmi_info is a per-thread copy from start-up; the info cache follows applies.
+ my %conf=%pgenerator_conf;
+ # Resolve transport through the renderer's policy, including retired values
+ # that may still be present in a saved configuration.
+ $conf{dv_transport}=&pg_dv_transport_mode($conf{dv_transport});
+ my $mode_line=&read_from_file("$info_dir/GET_HDMI_INFO.info");
+ $mode_line=$hdmi_info if(!defined($mode_line) || $mode_line!~/\d+x\d+/);
+ my $requested=PGIdleCard::requested_signal(\%conf,$mode_line);
+ my $sent=PGIdleCard::sent_signal(&webui_idle_card_readback());
+ return PGIdleCard::card_model($requested,$sent,&webui_idle_card_kit());
+}
+
+# The Output page polls every 5 s while the panel is visible; reuse a model
+# built in the last few seconds so polling costs no modetest run per request.
+our %_idle_card_model_cache=();
+sub webui_idle_card_model_cached (@) {
+ my $now=time();
+ return $_idle_card_model_cache{model} if(ref($_idle_card_model_cache{model}) eq "HASH" && $now-($_idle_card_model_cache{at}||0) < 5);
+ my $model=&webui_idle_card_model();
+ %_idle_card_model_cache=(at=>$now,model=>$model);
+ return $model;
+}
+
+sub webui_idle_card_render (@) {
+ my ($model,$levels,$scale,$file)=@_;
+ my $font_dir=&webui_idle_card_font_dir();
+ return "The card font is missing from the appliance." if($font_dir eq "");
+ return "ImageMagick is not installed." if(!$convert || !-x $convert);
+ my @args=PGIdleCard::convert_arguments($model,scale=>$scale,levels=>$levels,
+  fonts=>{regular=>"$font_dir/DejaVuSans.ttf",bold=>"$font_dir/DejaVuSans-Bold.ttf"});
+ # ImageMagick reads its arguments as UTF-8 bytes (the x and not-equal signs).
+ foreach my $arg (@args) { utf8::encode($arg) if(utf8::is_utf8($arg)); }
+ unlink($file);
+ my $status=system($convert,@args,"PNG24:$file");
+ return "ImageMagick could not draw the card (exit ".($status >> 8).")." if($status != 0 || !-s $file);
+ return "";
+}
+
+sub webui_idle_card_status_publish (@) {
+ my ($state,$detail,%extra)=@_;
+ my ($enabled,$delay)=&webui_idle_card_settings();
+ my %status=(%extra,state=>$state,detail=>(defined($detail) ? $detail : ""),enabled=>$enabled ? JSON::PP::true : JSON::PP::false,
+  delay_s=>$delay,updated_at=>time());
+ if(ref($_idle_card{shown}) eq "HASH") {
+  $status{card}=$_idle_card{shown}{card};
+ }
+ my $json=eval { JSON::PP->new->utf8->canonical->encode(\%status) } || "";
+ $_idle_card_status=$json if($json ne "");
+}
+
+# Change of state is worth a log line; the per-second poll is not.
+sub webui_idle_card_note (@) {
+ my ($key,$message)=@_;
+ return if(($_idle_card{last_note}||"") eq $key);
+ $_idle_card{last_note}=$key;
+ &log("WebUI: idle card $message");
+}
+
+# Reclaim interrupted attempts even when the next render fails. Keep every
+# image the installed command references; unreadable commands defer cleanup.
+sub webui_idle_card_cleanup (@) {
+ my %keep=map { my $file=$_; $file=~s{//+}{/}g; ($file=>1) } @_;
+ open(my $fh,"<",$command_file) or return;
+ return if(!-f $fh);
+ while(my $line=<$fh>) {
+  if($line=~/^IMAGE=(.+?)\s*$/) {
+   (my $file=$1)=~s{//+}{/}g;
+   $keep{$file}=1;
+  }
+ }
+ return if(!close($fh));
+ opendir(my $dir,"$var_dir/running") or return;
+ my @names=readdir($dir);
+ closedir($dir);
+ foreach my $name (@names) {
+  next if($name!~/^idle_card_.+\.png$/ || $name eq "idle_card_preview.png");
+  (my $file="$var_dir/running/$name")=~s{//+}{/}g;
+  next if($keep{$file});
+  unlink($file) or &log("WebUI: could not remove unused idle card image $name: $!");
+ }
+}
+
+# Builds the frame sequence for PATTERN_NAME=screensaver. Called from
+# webui_pattern on the renderer lane, for the idle timer and for Show now.
+sub webui_idle_card_pattern (@) {
+ my ($w,$h,$signal_mode,$black_rgb)=@_;
+ my $started=&webui_idle_card_now();
+ &webui_idle_card_cleanup();
+ my $model=&webui_idle_card_model();
+ my $levels=PGIdleCard::text_levels($signal_mode,&pg_dv_transport_mode());
+ my $scale=$h/1080;
+ $scale=0.5 if($scale < 0.5);
+ $scale=2.5 if($scale > 2.5);
+ # A new path per render: the renderer keeps a loaded texture until the
+ # IMAGE path changes. Keep the temporary-file owner until installation so
+ # returns and exceptions both discard an unused image immediately.
+ my $image=eval { File::Temp->new(TEMPLATE=>"idle_card_XXXXXXXX",SUFFIX=>".png",DIR=>"$var_dir/running",UNLINK=>1) };
+ if(!$image) {
+  my $error=$@||"unknown error";
+  $error=~s/\s+$//;
+  &log("WebUI: idle card image creation failed: $error");
+  return ("","The idle card image could not be created.");
+ }
+ my $file=$image->filename();
+ $file=~s{//+}{/}g;
+ my $error=&webui_idle_card_render($model,$levels,$scale,$file);
+ my ($card_w,$card_h)=$error eq "" ? PGIdleCard::png_dimensions($file) : ();
+ if($error eq "" && $card_w && $card_h && ($card_w > $w*0.94 || $card_h > $h*0.94)) {
+  my $fit=$scale*(($w*0.94/$card_w < $h*0.94/$card_h) ? $w*0.94/$card_w : $h*0.94/$card_h);
+  $error=&webui_idle_card_render($model,$levels,$fit,$file);
+  ($card_w,$card_h)=$error eq "" ? PGIdleCard::png_dimensions($file) : ();
+ }
+ $error="The card image could not be read back." if($error eq "" && !($card_w && $card_h));
+ if($error ne "") {
+  return ("",$error);
+ }
+ my $positions=PGIdleCard::hop_positions($w,$h,$card_w,$card_h,$PGIdleCard::HOP_COUNT);
+ # The frame around the card uses the stop frame's black, which in Dolby
+ # Vision is tunnel black rather than code 0; the PNG matches it.
+ my $pat=PGIdleCard::sequence_pattern(w=>$card_w,h=>$card_h,bg=>$black_rgb,image=>$file,positions=>$positions);
+ my $elapsed_ms=int((&webui_idle_card_now()-$started)*1000);
+ my $shown={
+  signature=>PGIdleCard::model_signature($model,"$signal_mode:$w:$h"),
+  checked=>&webui_idle_card_now(),
+  card=>{w=>$card_w+0,h=>$card_h+0,screen_w=>$w+0,screen_h=>$h+0,hop_ms=>$PGIdleCard::HOP_MS+0,
+   positions=>[map { [$_->[0]+0,$_->[1]+0] } @$positions],shown_at=>time(),headline=>$model->{headline},mismatches=>$model->{mismatches}+0},
+ };
+ &log("WebUI: idle card rendered (mode=$signal_mode card=${card_w}x$card_h screen=${w}x$h text=$levels->{value}/$levels->{label} mismatches=$model->{mismatches} render_ms=$elapsed_ms)");
+ return ($pat,"",$shown,$file,$image);
+}
+
+# One pass of the idle timer, run by the renderer lane whenever it has been
+# idle for a second. Cheap until the delay has elapsed: one stat() per pass.
+sub webui_idle_card_tick (@) {
+ my $now=&webui_idle_card_now();
+ return if($now < ($_idle_card{next_check}||0));
+ $_idle_card{next_check}=$now+1;
+ # Every writer renames a new file into place, so inode, size and mtime
+ # change on each write; the idle clock starts when a change is first seen.
+ my $signature=&webui_pattern_file_signature();
+ if($signature ne ($_idle_card{file_signature}||"")) {
+  my $name=$signature ne "" ? &webui_pattern_file_idle_name() : "";
+  $_idle_card{file_signature}=$signature;
+  $_idle_card{pattern}=$name;
+  $_idle_card{since}=$now;
+  delete($_idle_card{shown}) if($name ne "screensaver");
+ }
+ my $pattern=$_idle_card{pattern}||"";
+ my ($enabled,$delay)=&webui_idle_card_settings();
+ if($pattern eq "screensaver") {
+  if(!$enabled) {
+   &webui_idle_card_note("off-clear","turned off; returning the display to black");
+   &webui_pattern('{"name":"stop","only_if_idle":true,"only_if_unowned":true}');
+   &webui_idle_card_status_publish("off","The idle card is turned off.");
+   return;
+  }
+  my $shown=$_idle_card{shown};
+  if(ref($shown) ne "HASH") {
+   # Shown by an earlier daemon or thread: adopt it and compare next minute.
+   $_idle_card{shown}=$shown={signature=>"",checked=>$now};
+  }
+  if($now-($shown->{checked}||0) >= $IDLE_CARD_REFRESH_S) {
+   $shown->{checked}=$now;
+   if(&webui_idle_card_stabilization_wanted()) {
+    &webui_idle_card_note("stabilization","yielding to the stabilisation pattern");
+    &webui_pattern('{"name":"stop","only_if_idle":true,"only_if_unowned":true}');
+    return;
+   }
+   my $model=&webui_idle_card_model();
+   my $signal_mode=&webui_pattern_signal_mode("");
+   my $fresh=PGIdleCard::model_signature($model,"$signal_mode:".($w_s||1920).":".($h_s||1080));
+   my $renew_positions=$now >= ($shown->{renew_at}||0);
+   if($fresh ne ($shown->{signature}||"") || $renew_positions) {
+    &log($renew_positions ? "WebUI: idle card movement sequence expired; redrawing"
+     : "WebUI: idle card content changed; redrawing");
+    my $result=&webui_pattern('{"name":"screensaver","only_if_idle":true,"only_if_unowned":true}');
+    my $reply=eval { JSON::PP::decode_json($result) } || {};
+    if(($reply->{status}||"") ne "ok" || $reply->{unchanged}) {
+     my $held=$reply->{unchanged} || ($reply->{error_code}||"") eq "pattern-owned";
+     my $retry=$held ? $IDLE_CARD_BLOCKED_RECHECK_S : $IDLE_CARD_FAILURE_BACKOFF_S;
+     $shown->{checked}=$now-$IDLE_CARD_REFRESH_S+$retry;
+     $_idle_card{next_check}=$now+$retry;
+     &webui_idle_card_status_publish($held ? "held" : "error",
+      $reply->{message}||"The display changed while the card was being drawn.");
+     return;
+    }
+   }
+  }
+  &webui_idle_card_status_publish("showing","The card is on the TV.");
+  return;
+ }
+ if($pattern ne "stop" && $pattern ne "") {
+  &webui_idle_card_status_publish("busy",$pattern eq "stabilization"
+   ? "The stabilisation pattern holds the idle display while a meter is connected."
+   : "Pattern \"$pattern\" is on the display.");
+  $_idle_card{last_note}="";
+  return;
+ }
+ if(!$enabled) {
+  &webui_idle_card_status_publish("off","The idle card is turned off.");
+  return;
+ }
+ my $remaining=$delay-($now-($_idle_card{since}||$now));
+ if($remaining > 0) {
+  &webui_idle_card_status_publish("waiting","The display is idle.",shows_in_s=>int($remaining+0.999));
+  return;
+ }
+ # Ownership, video and stabilisation cost process and file checks, so they
+ # run only once the delay has passed, and at most every few seconds after.
+ return if($now < ($_idle_card{retry_at}||0));
+ my $held="";
+ my $owner=&webui_display_owner();
+ $held="$owner owns the display." if($owner ne "");
+ $held||="A video is playing." if(&webui_idle_card_video_playing());
+ $held||="The stabilisation pattern takes the idle display while a meter is connected." if(&webui_idle_card_stabilization_wanted());
+ $held||="The pattern renderer is not running." if(!&pattern_generator_is_running());
+ if($held ne "") {
+  &webui_idle_card_note("held:$held","held: $held");
+  &webui_idle_card_status_publish("held",$held);
+  $_idle_card{retry_at}=$now+$IDLE_CARD_BLOCKED_RECHECK_S;
+  return;
+ }
+ my $result=&webui_pattern('{"name":"screensaver","only_if_idle":true,"only_if_unowned":true}');
+ if($result=~/"status"\s*:\s*"ok"/ && $result!~/"unchanged"\s*:\s*true/) {
+  &webui_idle_card_note("shown","shown after ${delay} s idle");
+  &webui_idle_card_status_publish("showing","The card is on the TV.");
+  return;
+ }
+ my ($message)=$result=~/"message"\s*:\s*"([^"]*)"/;
+ $message="The display changed before the card was drawn." if(!defined($message) || $message eq "");
+ &webui_idle_card_note("failed:$message","not shown: $message");
+ &webui_idle_card_status_publish("error",$message);
+ $_idle_card{retry_at}=$now+$IDLE_CARD_FAILURE_BACKOFF_S;
+}
+
+# Status for the Output page: settings, the timer's view and a fresh model of
+# what the card says right now (the page shows it even while the card is off).
+sub webui_idle_card_status_json (@) {
+ my ($enabled,$delay)=&webui_idle_card_settings();
+ my $status=eval { JSON::PP::decode_json($_idle_card_status||"{}") } || {};
+ $status={} if(ref($status) ne "HASH");
+ $status->{enabled}=$enabled ? JSON::PP::true : JSON::PP::false;
+ $status->{delay_s}=$delay;
+ $status->{state}||="starting";
+ # The timer writes its view at most once a second while the renderer lane
+ # is free; a busy lane leaves it stale, which the page labels as such.
+ $status->{age_s}=$status->{updated_at} ? time()-$status->{updated_at} : undef;
+ my $model=eval { &webui_idle_card_model_cached() };
+ $status->{model}=$model if(ref($model) eq "HASH");
+ return JSON::PP->new->utf8->canonical->encode($status);
+}
+
+# Browser preview: the same layout at brighter levels, since the TV's 25-nit
+# codes are close to invisible on a monitor that is not in HDR.
+sub webui_idle_card_preview_png (@) {
+ my $model=&webui_idle_card_model_cached();
+ # GET workers can render concurrently. Read only this request's image and
+ # keep it outside the renderer lane's idle_card_*.png cleanup namespace.
+ my $image=eval { File::Temp->new(TEMPLATE=>"idle_preview_XXXXXXXX",SUFFIX=>".png",DIR=>"$var_dir/running",UNLINK=>1) };
+ if(!$image) {
+  my $error=$@||"unknown error";
+  $error=~s/\s+$//;
+  &log("WebUI: idle card preview creation failed: $error");
+  return (undef,"The preview image could not be created.");
+ }
+ my $file=$image->filename();
+ my $error=&webui_idle_card_render($model,{value=>232,label=>150,black=>0},1,$file);
+ return (undef,$error) if($error ne "");
+ my $data="";
+ if(open(my $fh,"<:raw",$file)) { local $/; $data=<$fh>; close($fh); }
+ return (undef,"The preview image could not be read.") if($data eq "");
+ return ($data,"");
 }
 
 sub webui_pattern_pq_decode_normalized (@) {
@@ -13015,17 +13476,7 @@ sub webui_pattern_request_guard (@) {
  my ($body,$peer)=@_;
  my $automatic=($body||"")=~/"only_if_unowned"\s*:\s*true/i;
  return "" if(!$automatic && &webui_route_is_loopback_pattern("POST","/api/pattern",$peer));
- my $owner="";
- my $execution=&webui_automation_read_execution();
- $owner="automation" if(ref($execution) eq "HASH" && &webui_automation_active_status($execution->{status}));
- $owner||="LG Auto Cal" if(&webui_meter_lg_autocal_running());
- $owner||="3D LUT calibration" if(&webui_meter_lg_3d_autocal_running());
- $owner||="Dolby Vision profiling" if(&webui_meter_lg_dv_profile_running());
- $owner||="measurement series" if(&webui_meter_series_alive());
- if(!$owner && &webui_meter_session_alive()) {
-  my $read=PGAutomation::read_json_file($_meter_read_file)||{};
-  $owner="meter reading" if(($read->{status}||"")=~/^(?:starting|measuring|running)$/);
- }
+ my $owner=&webui_display_owner();
  return "" if(!$owner);
  my ($name)=($body||"")=~/"name"\s*:\s*"([A-Za-z0-9_ -]+)"/;
  &log("WebUI: blocked external pattern ".($name||"unknown")." while $owner owns the display");
@@ -13039,7 +13490,15 @@ sub webui_pattern (@) {
  my ($name)=$body=~/"name"\s*:\s*"([^"]+)"/;
  return '{"status":"error","message":"Missing pattern name"}' if(!$name);
  $name=~s/[^a-zA-Z0-9_ -]//g;
- if($name eq "stop" && $body=~/"only_if_idle"\s*:\s*true/i) {
+ my $idle_only=$body=~/"only_if_idle"\s*:\s*true/i;
+ my $unowned_only=$body=~/"only_if_unowned"\s*:\s*true/i;
+ my $idle_policy_request=$name eq "screensaver" || ($name eq "stop" && $idle_only);
+ if($idle_policy_request || $unowned_only) {
+  my $blocked=&webui_pattern_request_guard($body,"");
+  return $blocked if($blocked ne "");
+ }
+ my $idle_signature=$idle_only ? &webui_pattern_file_signature() : "";
+ if(($name eq "stop" || $name eq "screensaver") && $body=~/"only_if_idle"\s*:\s*true/i) {
   my ($allowed,$current)=&webui_pattern_idle_refresh_allowed();
   if(!$allowed) {
    $current=~s/[^a-zA-Z0-9_ -]//g;
@@ -13070,10 +13529,13 @@ sub webui_pattern (@) {
  my ($pattern_signal_range)=$body=~/"pattern_signal_range"\s*:\s*"?(\d+)"?/;
  my ($transport_signal_range)=$body=~/"transport_signal_range"\s*:\s*"?(\d+)"?/;
  $transport_signal_range=$signal_range if(!defined $transport_signal_range || $transport_signal_range eq "");
+ # The information card observes the current link, including an external
+ # client's range. Taking WebUI range ownership here can restart that link.
+ $transport_signal_range=$pgenerator_conf{"rgb_quant_range"} if($idle_policy_request);
  $transport_signal_range=&webui_preferred_rgb_quant_range() if(!defined $transport_signal_range || $transport_signal_range eq "");
  $pattern_signal_range=$signal_range if(!defined $pattern_signal_range || $pattern_signal_range eq "");
  $pattern_signal_range=$transport_signal_range if(!defined $pattern_signal_range || $pattern_signal_range eq "");
- &apply_source_rgb_quant_range("webui",$transport_signal_range);
+ &apply_source_rgb_quant_range("webui",$transport_signal_range) if(!$idle_policy_request);
  my ($color_format_body)=$body=~/"color_format"\s*:\s*"?(\d+)"?/;
  my $pattern_color_format=defined($color_format_body) ? int($color_format_body) : int($pgenerator_conf{"color_format"} || 0);
 	 # Standard DV's outer HDMI tunnel is RGB Full, but its inner source
@@ -13083,6 +13545,7 @@ sub webui_pattern (@) {
 	 local $webui_pattern_image_source_range=($pattern_color_format == 0) ? $source_range : "FULL";
 	 my $w=$w_s || 1920; my $h=$h_s || 1080;
  my $pat=""; my $img=&webui_pattern_diag_image_file($name); my $pat_bits=&webui_pattern_effective_bits("",$signal_mode);
+ my ($idle_card_shown,$idle_card_file,$idle_card_image);
  # Simulated-meter capture: raw patch codes (pre bit-scaling) recorded for
  # spotread_sim at the end of this sub. Named solids/complex patterns are
  # resolved just before the record call.
@@ -13261,19 +13724,48 @@ elsif($pat eq "" && $name eq "uploaded_diag_video") {
    $pat="DRAW=RECTANGLE\nDIM=$pw,$ph\nRGB=$pr,$pg,$pb\nBG=$bg_rgb\nPOSITION=$px,$py\nEND=1\n";
   }
  }
+ # Idle information card — a moving PNG of the signal description. Rendering
+ # takes about a second, so an idle-only request re-checks the display after
+ # it: a pattern written meanwhile by another lane or a TCP client wins.
+ elsif($pat eq "" && $name eq "screensaver") {
+  my ($card_pat,$card_error);
+  ($card_pat,$card_error,$idle_card_shown,$idle_card_file,$idle_card_image)=&webui_idle_card_pattern($w,$h,$signal_mode,$black_rgb);
+  return '{"status":"error","message":"'.&_webui_json_escape($card_error).'"}' if($card_pat eq "");
+  $pat=$card_pat;
+  $pat_bits=&webui_pattern_effective_bits("IMAGE",$signal_mode);
+ }
  # Stop — full black (idle)
  elsif($pat eq "" && $name eq "stop") { $pat="DRAW=RECTANGLE\nDIM=$w,$h\nRGB=$black_rgb\nBG=$black_rgb\nPOSITION=0,0\nEND=1\n"; }
  elsif($pat eq "") {
   return '{"status":"error","message":"Unknown pattern: '.$name.'"}';
  }
- &video_program_stop("$program_video_to_kill");
- # Ensure the C renderer binary is running (auto-start on first pattern)
+ &video_program_stop("$program_video_to_kill") if(!$idle_policy_request || !$idle_only);
+ # An automatic idle update must not start a renderer that has stopped or
+ # entered a settings apply while the image was being prepared.
  if(!&pattern_generator_is_running()) {
-  &pattern_generator_start(1);
-  Time::HiRes::sleep(0.5);
+  if(!$idle_policy_request || !$idle_only) {
+   &pattern_generator_start(1);
+   Time::HiRes::sleep(0.5);
+  }
   if(!&pattern_generator_is_running()) {
-   &log("WebUI: renderer failed to start for pattern $name");
-   return '{"status":"error","message":"Pattern renderer failed to start"}';
+   &log("WebUI: renderer unavailable for pattern $name");
+   return '{"status":"error","message":"Pattern renderer is not running"}';
+  }
+ }
+ # Rendering, driver readback and renderer startup can take seconds. Recheck
+ # ownership and the command after preparation, immediately before writing.
+ if($idle_policy_request || $unowned_only) {
+  my $blocked=&webui_pattern_request_guard($body,"");
+  if($blocked ne "") {
+   return $blocked;
+  }
+  if($idle_only) {
+   my ($allowed,$current)=&webui_pattern_idle_refresh_allowed();
+   if(!$allowed || &webui_pattern_file_signature() ne $idle_signature
+      || ($name eq "screensaver" && (&webui_idle_card_video_playing() || &webui_idle_card_stabilization_wanted()))) {
+    $current=~s/[^a-zA-Z0-9_ -]//g;
+    return '{"status":"ok","pattern":"'.$current.'","unchanged":true}';
+   }
   }
  }
  if($pattern_color_format == 0 && $pat !~/^SOURCE_RANGE=/m) {
@@ -13297,10 +13789,32 @@ elsif($pat eq "" && $name eq "uploaded_diag_video") {
  # the default FRAME for single-shot patterns that have none.
  $pat="PATTERN_NAME=$name\nBITS=$pat_bits\nSOURCE_MAX=$pattern_source_max\n".$pat;
  $pat.="FRAME=$frame_default\n" if($pat !~ /^FRAME=/m);
- open(my $fh,">","$command_file.tmp");
- print $fh $pat;
- close($fh);
- rename("$command_file.tmp","$command_file");
+ # Legacy clients have their own writer. Do not share its staging filename,
+ # and retain the old image/status unless the command is actually installed.
+ my $tmp="$command_file.webui.$$".".".threads->tid();
+ my $written=0;
+ if(open(my $fh,">",$tmp)) {
+  my $printed=print $fh $pat;
+  my $closed=close($fh);
+  $written=rename($tmp,$command_file) if($printed && $closed);
+ }
+ if(!$written) {
+  my $error="$!";
+  unlink($tmp);
+  &log("WebUI: failed to install pattern $name: $error");
+  return '{"status":"error","message":"Could not install the pattern command"}';
+ }
+ $idle_card_image->unlink_on_destroy(0) if($idle_card_image);
+ if(ref($idle_card_shown) eq "HASH") {
+  # Renew even unchanging content after one complete movement sequence. Use
+  # monotonic time from installation so slow rendering cannot age it early.
+  $idle_card_shown->{renew_at}=&webui_idle_card_now()+$PGIdleCard::HOP_COUNT*$PGIdleCard::HOP_MS/1000;
+  $idle_card_shown->{card}{shown_at}=time();
+  $_idle_card{shown}=$idle_card_shown;
+  # Retire old images only after the new command has been installed. A
+  # cancelled render must leave the displayed card and its metadata intact.
+  &webui_idle_card_cleanup($idle_card_file);
+ }
  &create_return_file();
  # Record what is now on screen for the simulated meter. Patch/stabilization
  # captured raw codes above; named solid fields map to their 8-bit authoring
