@@ -1,10 +1,11 @@
 #!/usr/bin/perl
 # LLDV (Low Latency Dolby Vision, 12-bit YCbCr 4:2:2) is retired from the
-# user-facing surface. The Pi renderer has no 12-bit draw path -- resolve.pm
-# keeps the EGL surface at 8bpc -- so LLDV could never deliver its advertised
-# 12-bit precision, and a 12-bit draw only risks the unconverted green idle
-# frame documented in pattern.pm. Standard DV already carries 12-bit source
-# codes through the RPU tunnel, so nothing is lost by removing the option.
+# user-facing surface. LLDV as the WebUI configured it (12 bpc) kills the
+# renderer: it fails EGL config selection ("No EGL configs with appropriate
+# attributes") and exits, both when applied and when a persisted LLDV config is
+# read at startup (measured on an LG C1 against 2.12.2). Standard DV already
+# carries 12-bit source codes through the RPU tunnel, so nothing is lost by
+# removing the option.
 #
 # pg_dv_transport_mode() is the choke point for the DV transport config: every
 # dv_transport helper derives from it, and command.pm's

@@ -77,11 +77,12 @@ sub pg_is_pi4_family(@) {
 sub pg_dv_transport_mode(@) {
  # LLDV (Low Latency DoVi, 12-bit YCbCr 4:2:2) is retired here, the choke point
  # every dv_transport helper below derives from -- and, through
- # command.pm's normalize_dv_transport_conf(), the renderer's own config. The Pi
- # renderer has no 12-bit draw path -- resolve.pm keeps the EGL surface at 8bpc --
- # so LLDV could never deliver its advertised precision, and a 12-bit draw only
- # risks the unconverted green idle frame documented in pattern.pm. Standard DV
- # already carries 12-bit source codes through the RPU tunnel. Collapse any
+ # command.pm's normalize_dv_transport_conf(), the renderer's own config. LLDV as
+ # the WebUI configured it (12 bpc) kills the renderer: it fails EGL config
+ # selection ("No EGL configs with appropriate attributes") and exits, both when
+ # applied and when a persisted LLDV config is read at startup. Measured on an
+ # LG C1 against 2.12.2; standard DV runs on the same code and display. Standard
+ # DV already carries 12-bit source codes through the RPU tunnel. Collapse any
  # "lldv" -- explicit, persisted, or legacy -- so the DV transport config can
  # never resolve to LLDV. (This does not touch endpoints that carry a raw
  # color_format / dv_interface of their own -- the meter-series API and the LG

@@ -2208,9 +2208,9 @@ function dvRgbMaxBpc(value){
  return String(value||'').trim()==='10' ? '10' : '8';
 }
 function dvTransportDefaults(mode){
- // Low Latency DV is retired (see pg_dv_transport_mode in variables.pm): the Pi
- // renderer has no 12-bit draw path, so DV is always standard here, and
- // dvTransportMode() already forces the select to the standard value.
+ // Low Latency DV is retired (see pg_dv_transport_mode in variables.pm): it
+ // kills the Pi renderer at EGL config selection, so DV is always standard here,
+ // and dvTransportMode() already forces the select to the standard value.
  return {dv_transport:'standard',is_ll_dovi:'0',is_std_dovi:'1',dv_interface:'0',color_format:'0',max_bpc:'8'};
 }
 
