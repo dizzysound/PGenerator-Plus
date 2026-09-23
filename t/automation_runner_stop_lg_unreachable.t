@@ -57,6 +57,8 @@ sub stop_sequence_in_child {
  my (@seq, @logs);
  my $cal_calls = 0;
  my $run = {id=>$run_id,status=>'running',items=>[],lg_run_id=>'x'};
+ # _finish('failed') restores TPC/GSR after _stop_active() has returned.
+ $run->{panel_protection} = {restore_pending=>1} if $opt{restore_panel};
  local *main::_log = sub { push @logs, $_[0] };
  local *main::_log_action = sub {};
  local *main::_stop_progress = sub {};
@@ -78,14 +80,24 @@ sub stop_sequence_in_child {
    $cal_calls++;
    return $refused if !$up || ($opt{tv} eq 'refuses-once' && $cal_calls == 1);
   }
+  return $refused if $path eq '/api/lg/panel-protection' && !$up;
   return {status=>'ok'};
  };
  main::_stop_active();
+ if ($opt{restore_panel}) {
+  push @seq, 'HAZARDS';
+  main::_restore_run_hazards($run, $run->{items});
+ }
  my @short = map { (my $s = $_) =~ s{^/api/}{}; $s } @seq;
  return (\@short, \@logs);
 }
 
 sub connects { scalar grep { $_ eq 'CONNECT' } @{$_[0]} }
+sub after_marker {
+ my ($seq, $marker) = @_;
+ my ($i) = grep { $seq->[$_] eq $marker } 0..$#$seq;
+ return defined($i) ? [@$seq[$i+1..$#$seq]] : [];
+}
 sub before_meter_release {
  my ($seq) = @_;
  my @before;
@@ -102,6 +114,17 @@ sub before_meter_release {
  is(scalar(grep { /skipping further LG reconnects/ } @$logs), 1, 'the skipped reconnects are logged once');
 }
 {
+ # Measured on the unit 2026-09-23: with the TV off, the TPC/GSR restore after
+ # _stop_active() made its own three-attempt reconnect and then up to three
+ # pairing refreshes, over 10 minutes after cleanup had already failed to
+ # reach the TV.
+ my ($seq) = stop_sequence(tv=>'asleep', restore_panel=>1);
+ my $after = after_marker($seq, 'HAZARDS');
+ is(connects($after), 0, 'the TPC/GSR restore after cleanup does not reconnect again');
+ is(scalar(grep { $_ eq 'lg/panel-protection' } @$after), 1, 'the TPC/GSR re-enable is still sent once');
+ is(connects($seq), 3, 'the whole failure cleanup makes one three-attempt reconnect');
+}
+{
  my ($seq) = stop_sequence(tv=>'asleep', user_stop=>1);
  is(before_meter_release($seq), 0, 'user Stop: workers stop and the meter is released before any TV reconnect');
  is(connects($seq), 1, 'user Stop: a single reconnect attempt');
@@ -112,9 +135,10 @@ sub before_meter_release {
  is(connects($seq), 2, 'the retry refreshes the pairing, because the TV answered');
 }
 
-# Normal end-of-batch restoration also sets $STOPPING, and a transient refusal
-# after a picture-mode switch must keep its per-call reconnect there.
+# Normal end-of-batch restoration sets $STOPPING without $STOP_HANDLED, and a
+# transient refusal after a picture-mode switch must keep its per-call
+# reconnect there.
 my $runner = do { local $/; open(my $fh, '<', "$Bin/../usr/bin/pgen_automation_runner.pl") or die $!; <$fh> };
-like($runner, qr/my \$stop_cleanup = \$STOPPING && \$STOP_HANDLED;/, 'the skip applies only inside Stop/failure cleanup');
+like($runner, qr/my \$stop_cleanup = \$STOP_HANDLED \? 1 : 0;/, 'the skip applies only once Stop/failure cleanup has started');
 
 done_testing;

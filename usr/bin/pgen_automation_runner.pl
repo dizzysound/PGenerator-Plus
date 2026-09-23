@@ -76,10 +76,11 @@ our $WORKER_MANIFEST_INTERVAL = 60;
 # action re-probes it; any LG connection failure drops it immediately.
 my $LG_STATUS_CACHE_SECONDS = 10;
 my $LG_STATUS_HEALTHY_AT = 0;
-# Set when a reconnect during Stop/failure cleanup (_stop_active) has failed.
-# Each reconnect to a TV that does not answer costs about a minute, so the rest
-# of that cleanup sends its LG requests without reconnecting first instead of
-# retrying per call. Normal end-of-batch restoration is not affected.
+# Set when a reconnect has failed once Stop/failure cleanup has started
+# (_stop_active, then the TPC/GSR and hazard restore after it). Each reconnect
+# to a TV that does not answer costs about a minute, so the rest of that cleanup
+# sends its LG requests without reconnecting first instead of retrying per call.
+# Normal end-of-batch restoration runs without $STOP_HANDLED and is not affected.
 my $LG_CLEANUP_UNREACHABLE = 0;
 # Settings passes whose pre-read is known to be pointless: a full SDR picture
 # reset has just restored factory values, so c4 must write regardless.
@@ -526,7 +527,8 @@ sub _api_once_impl {
 
 sub _ensure_lg_connection {
     my ($force) = @_;
-    my $stop_cleanup = $STOPPING && $STOP_HANDLED;
+    # _stop_active() runs once per runner; after it only cleanup follows.
+    my $stop_cleanup = $STOP_HANDLED ? 1 : 0;
     return 0 if $stop_cleanup && $LG_CLEANUP_UNREACHABLE;
     my $ok = _reconnect_lg($force);
     if (!$ok && $stop_cleanup) {
