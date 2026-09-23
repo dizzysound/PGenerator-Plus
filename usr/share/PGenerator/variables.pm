@@ -70,9 +70,10 @@ sub pg_is_pi4_family(@) {
 #  standard - sink-led DV: metadata embedded in an RGB 8-bit tunnel; the
 #             display parses the tunnel itself. Requires full sink-led DV
 #             support in the TV.
-#  lldv     - low-latency (source-led) DV: PQ-encoded YCbCr 4:2:2 12-bit
-#             with the LL bit set in the Dolby VSIF. Some displays only
-#             decode this form (and may not even advertise a VSVDB).
+#  lldv     - RETIRED. Low-latency (source-led) DV: PQ-encoded YCbCr 4:2:2
+#             12-bit with the LL bit set in the Dolby VSIF. The Pi renderer
+#             has no EGL config for that surface and dies at startup, so
+#             pg_dv_transport_mode() below collapses it to standard.
 sub pg_dv_transport_mode(@) {
  # LLDV (Low Latency DoVi, 12-bit YCbCr 4:2:2) is retired here, the choke point
  # every dv_transport helper below derives from -- and, through
