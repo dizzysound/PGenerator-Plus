@@ -1058,8 +1058,10 @@ function pgAutomationDragStart(event,index){
  document.addEventListener('pointermove',move);document.addEventListener('pointerup',up);document.addEventListener('pointercancel',cancel);document.addEventListener('keydown',key);window.addEventListener('blur',cleanup);
 }
 function pgAutomationDragCancel(){pgAutomation.dragCancel?.();}
-async function pgAutomationNewQueue(){
- if(await pgAutomationStopEditing())pgAutomationNameQueue('new');
+function pgAutomationNewQueue(){
+ // Opens at once when nothing is being edited; callers fill the dialog next.
+ if(!pgAutomation.editingRunId){pgAutomationNameQueue('new');return Promise.resolve();}
+ return pgAutomationStopEditing().then(ok=>{if(ok)pgAutomationNameQueue('new');});
 }
 // The way out of editing a batch's pending jobs. The batch keeps the jobs it
 // has saved; only this browser's unsaved pending changes are dropped, and the
