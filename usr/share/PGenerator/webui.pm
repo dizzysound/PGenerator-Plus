@@ -152,22 +152,68 @@ sub webui_mdns_read_name (@) {
  return ("",$next_offset,0);
 }
 
+sub webui_mdns_name_bytes (@) {
+ my $name="";
+ foreach my $label (split(/\./,shift)) {
+  $name.=pack("C",length($label)).$label;
+ }
+ return $name.pack("C",0);
+}
+
+sub webui_mdns_a_record (@) {
+ my ($mdns_hostname,$best_ip)=@_;
+ return &webui_mdns_name_bytes("$mdns_hostname.local").pack("nnNn",1,0x8001,120,4).Socket::inet_aton($best_ip);
+}
+
+# RFC 6762 6.1 negative answer: an NSEC whose bitmap (window 0) lists only A.
+# Without it macOS never caches "no AAAA" and waits ~5s on every lookup.
+sub webui_mdns_nsec_record (@) {
+ my $mdns_hostname=shift;
+ my $name=&webui_mdns_name_bytes("$mdns_hostname.local");
+ # Next-domain is our own name; bitmap window 0, length 1, 0x40 = bit 1 = type A.
+ my $rdata=$name.pack("CCC",0,1,0x40);
+ return $name.pack("nnNn",47,0x8001,120,length($rdata)).$rdata;
+}
+
 sub webui_mdns_build_a_response (@) {
  my $mdns_hostname=shift;
  my $best_ip=shift;
  return "" if($mdns_hostname eq "" || $best_ip eq "");
- my $resp=pack("n",0);           # ID=0 for mDNS
- $resp.=pack("n",0x8400);        # flags: QR=1, AA=1
- $resp.=pack("nnnn",0,1,0,0);
- foreach my $label (split(/\./,"$mdns_hostname.local")) {
-  $resp.=pack("C",length($label)).$label;
+ # ID=0, QR=1 AA=1; the A answer plus the NSEC in Additional. Announcements use
+ # this too, so clients learn "no AAAA" before they ever ask.
+ return pack("nnnnnn",0,0x8400,0,1,0,1)
+  .&webui_mdns_a_record($mdns_hostname,$best_ip).&webui_mdns_nsec_record($mdns_hostname);
+}
+
+sub webui_mdns_build_aaaa_negative_response (@) {
+ my $mdns_hostname=shift;
+ my $best_ip=shift;
+ return "" if($mdns_hostname eq "" || $best_ip eq "");
+ return pack("nnnnnn",0,0x8400,0,1,0,1)
+  .&webui_mdns_nsec_record($mdns_hostname).&webui_mdns_a_record($mdns_hostname,$best_ip);
+}
+
+# Returns (wants A, wants AAAA) for questions about our name; ANY wants both.
+sub webui_mdns_query_wants (@) {
+ my ($buf,$mdns_hostname)=@_;
+ return (0,0) if(!defined($buf) || length($buf) < 12);
+ my ($id,$flags,$qdcount)=unpack("nnn",substr($buf,0,6));
+ return (0,0) if(($flags & 0x8000) || $qdcount < 1);
+ my ($want_a,$want_aaaa)=(0,0);
+ my $offset=12;
+ # Scan every question: macOS bundles A and AAAA, the second name compressed.
+ for(my $i=0;$i<$qdcount;$i++) {
+  my ($qname,$next_offset,$ok)=&webui_mdns_read_name($buf,$offset);
+  last if(!$ok);
+  $offset=$next_offset;
+  last if($offset + 4 > length($buf));
+  my ($qtype,$qclass)=unpack("nn",substr($buf,$offset,4));
+  $offset+=4;
+  next if(lc($qname) ne "$mdns_hostname.local" || ($qclass & 0x7FFF) != 1);
+  $want_a=1 if($qtype == 1 || $qtype == 255);
+  $want_aaaa=1 if($qtype == 28 || $qtype == 255);
  }
- $resp.=pack("C",0);
- $resp.=pack("nn",1,0x8001);
- $resp.=pack("N",120);
- $resp.=pack("n",4);
- $resp.=Socket::inet_aton($best_ip);
- return $resp;
+ return ($want_a,$want_aaaa);
 }
 
 ###############################################
@@ -291,37 +337,16 @@ sub webui_mdns (@) {
   next if(!defined $from);
   my ($qport,$qaddr)=Socket::sockaddr_in($from);
 
-  # Parse DNS query header
-  next if(length($buf) < 12);
-  my ($id,$flags,$qdcount)=unpack("nnn",substr($buf,0,6));
-  # Only respond to queries (QR=0)
-  next if($flags & 0x8000);
-  next if($qdcount < 1);
-
-  my $offset=12;
-  my $matched=0;
-  for(my $i=0;$i<$qdcount;$i++) {
-   my ($qname,$next_offset,$ok)=&webui_mdns_read_name($buf,$offset);
-   last if(!$ok);
-   $offset=$next_offset;
-   last if($offset + 4 > length($buf));
-   my ($qtype,$qclass)=unpack("nn",substr($buf,$offset,4));
-   $offset+=4;
-   if(lc($qname) eq "$mdns_hostname.local" && ($qclass & 0x7FFF) == 1 && ($qtype == 1 || $qtype == 255)) {
-    $matched=1;
-    last;
-   }
-  }
-
-  # Respond to A record queries for pgenerator.local, even when bundled with
-  # compressed AAAA questions in the same packet.
-  next if(!$matched);
+  # A (or ANY) gets the address; an AAAA-only question gets the NSEC answer.
+  my ($want_a,$want_aaaa)=&webui_mdns_query_wants($buf,$mdns_hostname);
+  next if(!$want_a && !$want_aaaa);
 
   my $querier_ip=Socket::inet_ntoa($qaddr);
   my $best_ip=&webui_mdns_best_ip($querier_ip);
   next if($best_ip eq "");
 
-  my $resp=&webui_mdns_build_a_response($mdns_hostname,$best_ip);
+  my $resp=$want_a ? &webui_mdns_build_a_response($mdns_hostname,$best_ip)
+   : &webui_mdns_build_aaaa_negative_response($mdns_hostname,$best_ip);
   next if($resp eq "");
 
   my $IP_MULTICAST_IF=eval { Socket::IP_MULTICAST_IF() } || 32;
