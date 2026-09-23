@@ -76,6 +76,11 @@ our $WORKER_MANIFEST_INTERVAL = 60;
 # action re-probes it; any LG connection failure drops it immediately.
 my $LG_STATUS_CACHE_SECONDS = 10;
 my $LG_STATUS_HEALTHY_AT = 0;
+# Set when a reconnect during Stop/failure cleanup (_stop_active) has failed.
+# Each reconnect to a TV that does not answer costs about a minute, so the rest
+# of that cleanup sends its LG requests without reconnecting first instead of
+# retrying per call. Normal end-of-batch restoration is not affected.
+my $LG_CLEANUP_UNREACHABLE = 0;
 # Settings passes whose pre-read is known to be pointless: a full SDR picture
 # reset has just restored factory values, so c4 must write regardless.
 my %SKIP_PREREAD;
@@ -521,6 +526,19 @@ sub _api_once_impl {
 
 sub _ensure_lg_connection {
     my ($force) = @_;
+    my $stop_cleanup = $STOPPING && $STOP_HANDLED;
+    return 0 if $stop_cleanup && $LG_CLEANUP_UNREACHABLE;
+    my $ok = _reconnect_lg($force);
+    if (!$ok && $stop_cleanup) {
+        $LG_CLEANUP_UNREACHABLE = 1;
+        _log('the paired LG TV did not answer during cleanup; skipping further LG reconnects for this cleanup: '
+            . ($::LAST_ERROR || 'unknown error'));
+    }
+    return $ok;
+}
+
+sub _reconnect_lg {
+    my ($force) = @_;
     return 1 if !$force && $LG_STATUS_HEALTHY_AT
         && time() - $LG_STATUS_HEALTHY_AT < $LG_STATUS_CACHE_SECONDS;
     $LG_STATUS_HEALTHY_AT = 0;
@@ -560,6 +578,8 @@ sub _lg_action_path {
     my ($path) = @_;
     return 0 if !defined($path) || $path !~ m{\A/api/lg/};
     return 0 if $path =~ m{\A/api/lg/(?:status|connect|disconnect)\z};
+    # Stopping the DV worker signals a local process; it never reaches the TV.
+    return 0 if $path =~ m{\A/api/lg/dv-profile/(?:stop|kill)\z};
     return 1;
 }
 
@@ -731,7 +751,8 @@ sub _api {
     my $attempt = 0;
     # LG reconnects stay enabled while stopping or restoring preflight
     # context: those paths must reach the TV to release ownership, and the
-    # retry is bounded (three pairing refreshes), so a transient websocket
+    # retry is bounded (three pairing refreshes, and none once a Stop/failure
+    # cleanup reconnect has failed; see $LG_CLEANUP_UNREACHABLE), so a transient websocket
     # refusal right after a picture-mode switch no longer turns a fully
     # checked queue into a "cleanup required" interruption.
     my $lg_preflighted = 0;
@@ -3951,6 +3972,7 @@ sub _stop_active {
     my ($parking) = @_;
     return if $STOP_HANDLED++;
     $STOPPING = 1;
+    $LG_CLEANUP_UNREACHABLE = 0;
     $CLEANUP_DEADLINE = time() + $CLEANUP_RETRY_BUDGET;
     _keep_current_mode_on_stop(_current_mode_stop_requested() ? 'stop' : 'failure') if !$parking;
     # Journal an unfinished cleanup before issuing device commands. A process
