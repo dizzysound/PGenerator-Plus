@@ -1028,6 +1028,31 @@ sub lg_webos_port_open (@) {
  return 0;
 }
 
+# Per-thread cache for lg_status_data()'s live SSAP probe: the WebUI polls status,
+# and an absent TV costs two 0.22s timeouts. A successful connect notes it reachable.
+my %_lg_reachable_cache;
+my $LG_REACHABLE_CACHE_SECONDS=2;
+
+sub lg_webos_reachable_reset (@) {
+ %_lg_reachable_cache=();
+}
+
+sub lg_webos_reachable_note (@) {
+ my ($ip,$ok)=@_;
+ return if(!&lg_valid_ipv4($ip));
+ $_lg_reachable_cache{$ip}={ ok => ($ok ? 1 : 0), at => time() };
+}
+
+sub lg_webos_reachable_cached (@) {
+ my $ip=shift;
+ return 0 if(!&lg_valid_ipv4($ip));
+ my $hit=$_lg_reachable_cache{$ip};
+ return $hit->{"ok"} if(ref($hit) eq "HASH" && time() - $hit->{"at"} < $LG_REACHABLE_CACHE_SECONDS);
+ my $ok=&lg_webos_port_open($ip) ? 1 : 0;
+ &lg_webos_reachable_note($ip,$ok);
+ return $ok;
+}
+
 sub lg_ssdp_devices (@) {
  my @devices=();
  my %seen=();
@@ -1591,6 +1616,7 @@ sub lg_update_connect_metadata (@) {
  if(($result->{"status"}||"") eq "ok") {
     my $ip=$result->{"ip"}||$manual_ip||"";
     $clients->{"ip"}=$ip if($ip ne "");
+    &lg_webos_reachable_note($ip,1);
     $clients->{"client_key"}=$result->{"client_key"} if(($result->{"client_key"}||"") ne "");
     $clients->{"name"}=$result->{"name"} if(($result->{"name"}||"") ne "");
     $clients->{"model_name"}=$result->{"model_name"} if(($result->{"model_name"}||"") ne "");
@@ -1676,7 +1702,11 @@ sub lg_status_data (@) {
  my $pin_pending=(ref($pin_state) eq "HASH" && ($pin_state->{"status"}||"") eq "pending") ? 1 : 0;
  my $paired=($client_key ne "" && !$pin_pending) ? 1 : 0;
  my $disconnected=($clients->{"disconnected"} && $paired) ? 1 : 0;
- my $connected=($paired && !$disconnected) ? 1 : 0;
+ # A saved pairing is not a connection: a TV in standby closes both SSAP ports, and
+ # readiness, resume and the runner trust `connected` to skip reconnecting.
+ my $probe_ip=$stored_ip ne "" ? $stored_ip : ($manual_ip ne "" ? $manual_ip : $auto_ip);
+ my $reachable=($paired && !$disconnected) ? &lg_webos_reachable_cached($probe_ip) : 0;
+ my $connected=($paired && !$disconnected && $reachable) ? 1 : 0;
  my $supported=($detected || $paired || $stored_ip ne "" || $manual_ip ne "" || $auto_ip ne "") ? 1 : 0;
  my $detection_source=$auto_ip ne "" ? ($auto->{"source"}||"mdns-hostname") : ($detected ? ($cec_tv_vendor ne "" ? "cec-vendor" : "cec-osd-name") : "manual-only");
  my $message=$message_override;
@@ -1686,6 +1716,9 @@ sub lg_status_data (@) {
      $message=$pin_state->{"message"}||"LG TV should now be showing a PIN. Enter it below and click Submit PIN to finish pairing.";
     } elsif($disconnected) {
      $message="LG TV is disconnected. Connect will reuse the saved key without another PIN.";
+    } elsif($paired && !$reachable) {
+     my $tv=($stored_name ne "") ? $stored_name : "The paired LG TV";
+     $message="$tv is not answering at $probe_ip on ports 3000/3001. Turn the TV on, then click Connect.";
     } elsif($paired && $stored_name ne "") {
      $message="Stored LG WebOS pairing is ready for $stored_name. Click Connect to reconnect or refresh TV info.";
   } elsif($paired) {
@@ -1711,6 +1744,7 @@ sub lg_status_data (@) {
   detection_limited => ($auto_ip ne "") ? &lg_json_false() : &lg_json_true(),
   detection_source => $detection_source,
   paired => &lg_json_bool($paired),
+  reachable => &lg_json_bool($reachable),
   connected => &lg_json_bool($connected),
   disconnected => &lg_json_bool($disconnected),
       pair_prompted => $pin_pending ? &lg_json_true() : &lg_json_false(),
@@ -2042,6 +2076,10 @@ sub webui_lg_connect (@) {
   pair_timeout => 55,
  });
  &lg_update_connect_metadata($result,$manual_ip || $ip);
+ # The helper never reports `connected`, so a failed attempt would otherwise inherit
+ # the stored-pairing flag; the runner's reconnect loop checks only that field.
+ $result={ status => "error" } if(ref($result) ne "HASH");
+ $result->{"connected"}=&lg_json_false() if(($result->{"status"}||"") ne "ok");
  return &lg_encode_json(&lg_status_response($result->{"status"}||"error",$result->{"message"}||"LG connection failed",$result));
 }
 
