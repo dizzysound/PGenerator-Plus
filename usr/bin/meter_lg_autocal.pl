@@ -13869,7 +13869,9 @@ sub lg_autocal_26_hdr20_dpg_gain {
 # not Display-P3. The matrix below is the standard BT.709 XYZ->linear-RGB
 # transform (sRGB inverse, D65), so an input XYZ is mapped to linear BT.709
 # channel coordinates; the per-channel gain is then target/measured, clamped
-# to [0.5, 2.0]. The reference SDR workflow applies the same target/measured
+# to [0.5, 2.0]. A channel projecting to <= 0 while Y and another channel are
+# valid was read below the meter floor and gets the 2.0 ceiling instead of
+# 1.0 (see the loop below). The reference SDR workflow applies the same target/measured
 # ratio pattern with BT.709 targets, which is what the LG TV's BT.709 gamut
 # expects when BT709_3BY3_GAMUT_DATA is the active 3x3 matrix (which the
 # SDR direct-DPG upload path now ensures on every cycle).
