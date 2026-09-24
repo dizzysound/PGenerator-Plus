@@ -1612,11 +1612,9 @@ async function pgAutomationEditActiveQueue(){
   pgAutomation.editChecked='';await pgAutomationCheckEditBinding(pgAutomationCurrentRun());
  }
 }
-// Pending edits bind the draft to one run, and the binding is saved with the
-// draft. Once that run has ended or been deleted it can never take the edit,
-// yet the binding hid Run queue and refused new queues, even after a reload.
-// Mirrors webui_automation_active_status: stopping/completing are left alone
-// because they settle on their own.
+// Pending edits bind the saved draft to one run. Once that run ends or is
+// deleted, the binding would hide Run queue for good, even across reloads.
+// Mirrors webui_automation_active_status (pinned by t/automation_active_status_sync.t).
 const PG_AUTOMATION_ACTIVE_STATUSES=['starting','running','paused','stopping','completing','interrupted'];
 function pgAutomationReleaseEdit(reason){
  if(!pgAutomation.editingRunId)return;
@@ -1626,7 +1624,7 @@ function pgAutomationReleaseEdit(reason){
  pgAutomationSaveDraft();pgAutomationRenderSavedQueues();pgAutomationRenderQueue();
  pgAutomationNotice('The run these jobs belonged to '+reason+'; they are now an ordinary unsaved draft.'+(ran>0?' The first '+(ran===1?'job':ran+' jobs')+' already ran in that batch; remove '+(ran===1?'it':'them')+' if you do not want to run '+(ran===1?'it':'them')+' again.':'')+' Nothing has started.','warning');
 }
-// Checks the run the draft is bound to. Only a definite answer releases it:
+// Checks the run the draft is bound to. Only a definite answer releases it;
 // a failed or slow request keeps the binding and retries on the next poll.
 async function pgAutomationCheckEditBinding(current){
  const id=pgAutomation.editingRunId;
@@ -1639,6 +1637,7 @@ async function pgAutomationCheckEditBinding(current){
  if(pgAutomation.editChecked===id)return;
  pgAutomation.editChecking=id;
  try{
+  // fetchJSON resolves null on failure or timeout; neither branch below matches, so the binding stays.
   const result=await fetchJSON('/api/automation/runs/'+encodeURIComponent(id),{_quiet:true,_timeoutMs:30000});
   if(pgAutomation.editingRunId!==id)return;
   if(result?.run){
