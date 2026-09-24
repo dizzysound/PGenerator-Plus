@@ -584,6 +584,8 @@ sub lg_mark_disconnected (@) {
  delete($clients->{"pin_pairing"});
  $clients->{"disconnected"}=&lg_json_true();
  $clients->{"disconnected_at"}=time();
+ # A cached probe answer predates the disconnect; probe afresh next time.
+ &lg_webos_reachable_reset();
  # A power-cycle or unplug drops the WebSocket and lands here.
  # last_written_picture_mode is only trustworthy while the session that wrote
  # it is still up: after a disconnect the panel may have been switched by
@@ -2085,10 +2087,12 @@ sub webui_lg_connect (@) {
   connect_timeout => 5,
   pair_timeout => 55,
  });
+ # Normalize before recording it: a missing result is a failed connect and must
+ # set the failure marker, which lg_update_connect_metadata skips for a non-hash.
+ $result={ status => "error" } if(ref($result) ne "HASH");
  &lg_update_connect_metadata($result,$manual_ip || $ip);
  # The helper never reports `connected`, so a failed attempt would otherwise inherit
  # the stored-pairing flag; the runner's reconnect loop checks only that field.
- $result={ status => "error" } if(ref($result) ne "HASH");
  $result->{"connected"}=&lg_json_false() if(($result->{"status"}||"") ne "ok");
  return &lg_encode_json(&lg_status_response($result->{"status"}||"error",$result->{"message"}||"LG connection failed",$result));
 }

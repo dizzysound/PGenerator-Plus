@@ -85,6 +85,21 @@ ok(!$s->{connected},'status after a failed connect is not connected, even with o
 ok($s->{connect_failed},'status reports the failed connect');
 like($s->{message},qr/last connection .* failed/i,'the message names the failed connection');
 
+# A helper that returns no result at all (a crash, garbled output) is a failed
+# connect too: it must set the marker, not leave status reading connected.
+delete $clients{connect_failed_at};
+local *main::lg_helper_run=sub {
+ my $req=shift;
+ return {status=>'ok'} if(($req->{action}||'') eq 'probe');
+ return undef;
+};
+$r=&main::lg_decode_json(&main::webui_lg_connect('{}'));
+is($r->{status},'error','a connect with no helper result reports an error');
+ok(!$r->{connected},'a connect with no helper result reports connected: false');
+$s=status_now();
+ok($s->{reachable} && !$s->{connected},'status after a connect with no helper result is not connected, even with open ports');
+ok($s->{connect_failed},'status reports the connect with no helper result as failed');
+
 # A successful connect proves reachability: a stale "unreachable" cache entry
 # from a status call made just before the TV woke must not contradict it.
 $port_open=0;
@@ -98,6 +113,16 @@ is($r->{status},'ok','the successful connect reports ok');
 ok($r->{connected},'a successful connect is connected despite an earlier cached miss');
 $s=status_now();
 ok($s->{connected} && !$s->{connect_failed},'a successful connect clears the failure marker');
+
+# A disconnect (power-cycle, unplug) drops the cached probe, so the next status
+# probes the TV afresh instead of reusing an answer from before it went away.
+&main::lg_status_data();
+$port_open=0;
+&main::lg_mark_disconnected();
+delete $clients{disconnected};
+$s=&main::lg_status_data();
+ok(!$s->{reachable} && !$s->{connected},'status right after a disconnect probes afresh');
+$port_open=1;
 
 # Readiness must not pass a paired TV that is not connected; it has to try
 # the reconnect, which produces the "turn the TV on" error.
