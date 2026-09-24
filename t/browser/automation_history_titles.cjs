@@ -53,6 +53,13 @@ const lg=fs.readFileSync(path.join(root,'webui-lg.js'),'utf8');
    pgAutomationRenderHistoryList();await new Promise(r=>setTimeout(r,50));
    check(document.querySelector('.auto-history-row .auto-history-details').open,'a refresh keeps the expanded row open');
    check(digestCalls===1&&document.querySelector('.auto-history-row .auto-history-jobs').textContent.includes('HDR10 Filmmaker'),'and reuses the fetched digest');
+   // A running run keeps its status while its jobs progress: never reuse its digest.
+   const running=document.createElement('details');running.innerHTML='<div class="auto-history-jobs"></div>';running.open=true;
+   pgAutomation.history.push({...hdr,id:'live-run',status:'running'});
+   await pgAutomationHistoryDetails(running,pgAutomation.history.length-1);delete running.dataset.loaded;
+   await pgAutomationHistoryDetails(running,pgAutomation.history.length-1);
+   check(digestCalls===3,'a running run is fetched again each time it is expanded');
+   pgAutomation.history.pop();
    // Artifact buttons open LG Calibration History at the entry.
    document.body.insertAdjacentHTML('beforeend','<div id="lgCalHistoryModal" style="display:none"><div data-id="3d:other"></div><div data-id="3d:20260915_214849_OLED65C1PUB_hdr10">entry</div></div>');
    let opened=0;window.lgOpenCalHistoryModal=()=>{opened++;document.getElementById('lgCalHistoryModal').style.display='block';};window.lgRefreshCalHistory=async()=>{};

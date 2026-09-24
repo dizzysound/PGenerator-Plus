@@ -14700,9 +14700,10 @@ sub webui_automation_job_digest (@) {
   lut_3d=>(@luts || ($three->{upload_status}||"") eq "ok") ? 1 : 0,
   post_readings=>scalar(@post),artifacts=>\@artifacts,
  };
- $digest->{de}=$de+0 if(defined($de) && $de=~/\A-?[0-9.]+(?:[eE][+-]?[0-9]+)?\z/);
+ my $number=sub { return defined($_[0]) && $_[0]=~/\A-?[0-9.]+(?:[eE][+-]?[0-9]+)?\z/ ? 1 : 0; };
+ $digest->{de}=$de+0 if($number->($de));
  $digest->{formula}=lc($grey->{delta_e_formula}||$item->{delta_e_formula}||(ref($item->{calibration}) eq "HASH" ? $item->{calibration}{delta_e_formula} : "")||"");
- $digest->{peak_nits}=$peak+0 if(defined($peak) && $peak=~/\A[0-9.]+\z/ && $peak > 0);
+ $digest->{peak_nits}=$peak+0 if($number->($peak) && $peak > 0);
  $digest->{started_at}=$started+0 if($started);
  $digest->{completed_at}=$ended+0 if($ended);
  return $digest;
@@ -14805,7 +14806,9 @@ sub webui_automation_listing_entries (@) {
   # field (the row keys are a subset of every shape written so far), but no
   # job digests, which need the manifest. Past the time budget the trimmed
   # row is listed as it is and left on disk for a later listing to finish.
-  # One that does not hold a row is always rebuilt from the manifest.
+  # One that does not hold a row is always rebuilt from the manifest, budget
+  # or not: without a row the run could not be listed at all. A wiped store
+  # therefore decodes every manifest in one listing, as it did before v5.
   my $trimmed;
   $trimmed=&webui_automation_listing_upgrade($cached->{summary})
    if(ref($cached) eq "HASH" && ($cached->{version}||0) != $WEBUI_LISTING_CACHE_VERSION && ($cached->{key}||"") eq $key && ref($cached->{summary}) eq "HASH");

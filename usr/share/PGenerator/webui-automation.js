@@ -1759,8 +1759,10 @@ function pgAutomationHistoryJobHtml(job){
 async function pgAutomationHistoryDetails(details,index){
  const run=pgAutomation.history[index],target=details.querySelector('.auto-history-jobs');
  if(!details.open||!run||!target||details.dataset.loaded===run.id)return;
- // Keyed by status too: a run still in progress gains results as it goes.
+ // A run in progress keeps its status while its jobs gain results, so only
+ // a finished run's digest is reused.
  const cache=pgAutomation.historyDigests=pgAutomation.historyDigests||{},key=run.id+'|'+run.status;
+ if(['starting','running','completing','stopping','paused'].includes(run.status))delete cache[key];
  if(!cache[key])target.textContent='Loading job details…';
  const result=cache[key]||await fetchJSON('/api/automation/runs/'+encodeURIComponent(run.id)+'/digest',{_quiet:true,_timeoutMs:30000});
  if(!result||!Array.isArray(result.jobs)){target.textContent=(result&&result.message)||'Unable to load job details.';return;}

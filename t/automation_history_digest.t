@@ -57,6 +57,10 @@ my $cal=PGAutomation::run_dir('run-hdr').'/items/0/calibration';
 put("$cal/grey-state.json",'{"status":"complete","hdr20_1d_dpg_final_de":0.974503979702557,"hdr20_1d_dpg_best_de":"0.9745","delta_e_formula":"deitp",'
  .'"final_1d_lut_uploaded":true,"hdr20_1d_tonemap_peak_luminance":673.974035,"readings":[{"de":4.1},{"de":3.2}]}');
 put("$cal/3d-state.json",'{"status":"complete","upload_status":"ok","upload":{"upload_verified":true},"upload_verified":true}');
+# An SDR-style job whose white is written in exponent notation.
+PGAutomation::write_json_atomic(PGAutomation::run_dir('run-sdr').'/run.json',{id=>'run-sdr',token=>'t4',status=>'complete',queue_name=>'q',created_at=>$t0-100,
+ items=>[{name=>'SDR Filmmaker',signal_format=>'sdr',picture_mode=>'filmMaker',status=>'complete'}]});
+put(PGAutomation::run_dir('run-sdr').'/items/0/calibration/grey-state.json','{"sdr_1d_dpg_final_de":8.4e-1,"calibrated_white_luminance":1.4087e2}');
 put("$cal/20260915_214849_OLED65C1PUB_hdr10_matrix_hdrFilmMaker.bin",'lut');
 put(PGAutomation::run_dir('run-hdr').'/items/0/post/greyscale-21.json','{}');
 
@@ -104,6 +108,9 @@ ok(!$art{'1dfile:d'},'nor one for another picture mode');
 my ($multi)=grep { $_->{name} eq 'HLG Cinema' } @{main::webui_automation_run_digest('run-multi')->{jobs}};
 is($multi->{status},'not-started','a job the run never reached says so');
 is_deeply($multi->{stages},[qw(calibration apply_all)],'unset stages take the editor defaults');
+my ($sdr)=@{main::webui_automation_run_digest('run-sdr')->{jobs}};
+is($sdr->{de},0.84,'an SDR dE in exponent notation is read');
+is($sdr->{peak_nits},140.87,'and so is its calibrated white, which stands in for a peak');
 ok(!defined(main::webui_automation_run_digest('../etc')),'a run ID that is not a path component is refused');
 
 # Reverse map for LG Calibration History.
