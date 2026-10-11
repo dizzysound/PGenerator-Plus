@@ -133,6 +133,18 @@ is($res->{status}, 'error', 'SSID over 32 bytes rejected');
 $res = decode_json(main::webui_wifi_connect(connect_body("a\x01b", '')));
 is($res->{status}, 'error', 'SSID with a control byte rejected');
 is(scalar(@sudo), 0, 'rejected requests never reach sudo');
+for my $bad ('{"ssid":123,"psk":"x"}', '{"ssid":"net","psk":123}', '{"ssid":"net","psk":["a"]}',
+             '{"ssid":"net","psk":{"a":1}}', '{"ssid":"net","psk":true}', '{"ssid":["net"],"psk":"x"}') {
+  $res = decode_json(main::webui_wifi_connect($bad));
+  is($res->{status}, 'error', "non-string field rejected: $bad");
+}
+$res = decode_json(main::webui_wifi_connect(connect_body('-p', 'x')));
+is($res->{status}, 'error', 'SSID starting with - rejected');
+is(scalar(@sudo), 0, 'wrong-type and leading-dash requests never reach sudo');
+$res = decode_json(main::webui_wifi_connect('{"ssid":"123"}'));
+is($res->{status}, 'ok', 'string SSID with no psk still connects (open network)');
+$res = decode_json(main::webui_wifi_connect('{"ssid":"net","psk":null}'));
+is($res->{status}, 'ok', 'null psk treated as absent');
 
 # wifi_wait_completed compares wpa_cli status text: the encoder must be the
 # inverse of the decoder the web UI uses.

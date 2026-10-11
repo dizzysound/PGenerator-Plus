@@ -11550,6 +11550,15 @@ sub webui_wifi_scan_json (@) {
 
 # Pull the string fields the Wi-Fi picker posts. A real JSON decode, so SSIDs
 # and passphrases containing quotes or backslashes survive the round trip.
+# A missing psk means an open network; a psk of any non-string type is an
+# error (returned as undef) rather than silently becoming an open connect.
+sub _webui_json_is_string (@) {
+ my $v=shift;
+ return 0 if(!defined $v || ref($v));
+ require B;
+ return (B::svref_2object(\$v)->FLAGS & B::SVp_POK()) ? 1 : 0;
+}
+
 sub _webui_wifi_connect_fields (@) {
  my $body=shift;
  my $req=eval { JSON::PP->new->utf8(1)->decode($body) };
@@ -11557,7 +11566,8 @@ sub _webui_wifi_connect_fields (@) {
  my @out;
  foreach my $key ("ssid","psk") {
   my $v=$req->{$key};
-  $v="" if(!defined $v || ref($v));
+  if(!defined $v) { $v=""; }
+  elsif(!&_webui_json_is_string($v)) { return (undef,undef); }
   utf8::encode($v);
   push @out,$v;
  }
@@ -11567,10 +11577,13 @@ sub _webui_wifi_connect_fields (@) {
 sub webui_wifi_connect (@) {
  my $body=shift;
  my ($ssid,$psk)=&_webui_wifi_connect_fields($body);
+ if(!defined $ssid) {
+  return '{"status":"error","message":"SSID and password must be strings"}';
+ }
  if($ssid eq "") {
   return '{"status":"error","message":"Missing SSID"}';
  }
- if(length($ssid)>32 || $ssid=~/[\x00-\x1f\x7f]/ || $psk=~/[\x00-\x1f\x7f]/) {
+ if(length($ssid)>32 || $ssid=~/[\x00-\x1f\x7f]/ || $psk=~/[\x00-\x1f\x7f]/ || $ssid=~/^-/) {
   return '{"status":"error","message":"Invalid SSID or password"}';
  }
  my $raw=&sudo("WIFI_APPLYCONF","wlan0",$ssid,$psk||"");
