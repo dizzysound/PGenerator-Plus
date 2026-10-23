@@ -19,7 +19,7 @@ use strict;
 use warnings;
 use FindBin qw($Bin);
 use File::Temp qw(tempdir);
-use Test::More tests => 48;
+use Test::More tests => 50;
 
 my $dir = "$Bin/../usr/share/PGenerator";
 ok(-f "$dir/pattern.pm", 'pattern.pm is present');
@@ -108,7 +108,11 @@ for my $flag (qw(dv_status is_ll_dovi is_std_dovi)) {
   is($bits_default, 8, "sync_pattern_bits_default pins 8 bpc for DV via $flag");
 }
 conf(max_bpc => 12);
-is($bits_default, 12, 'and leaves a non-DV 12 bpc link alone');
+is($bits_default, 10, 'and keeps pattern codes 10-bit on a non-DV 12 bpc link (the renderer sends it as 10 bpc)');
+conf(max_bpc => 10);
+is($bits_default, 10, 'a 10 bpc link keeps 10-bit codes');
+conf(max_bpc => 8);
+is($bits_default, 8, 'an 8 bpc link keeps 8-bit codes');
 
 # --- the frame itself is full-screen black ---
 conf();
@@ -160,8 +164,8 @@ my $cmd = "$Bin/../usr/share/PGenerator/command.pm";
 open(my $cf, '<', $cmd) or die "read $cmd: $!";
 my $src = do { local $/; <$cf> };
 close $cf;
-my ($body) = $src =~ /(sub pattern_generator_start\(\@\)\s*\{.*?\n\})/s;
-ok($body, 'found the pattern_generator_start body');
+my ($body) = $src =~ /(sub pattern_generator_start_locked\(\@\)\s*\{.*?\n\})/s;
+ok($body, 'found the pattern_generator_start_locked body');
 $body //= '';
 ok(index($body, '&seed_idle_pattern_file();') >= 0,
    'pattern_generator_start seeds the idle pattern');

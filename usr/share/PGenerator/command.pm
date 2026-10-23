@@ -316,6 +316,9 @@ sub apply_drm_properties (@) {
  return if($connector_id eq "");
  # Set max bpc — the binary fails to apply this property
  my $max_bpc=$pgenerator_conf{"max_bpc"};
+ # Outside Dolby Vision the renderer sends 12 bpc out as 10 (10 bit surface);
+ # pre-set the same value so the first commit needs no extra modeset.
+ $max_bpc=10 if($max_bpc eq "12" && int($pgenerator_conf{"dv_status"} || 0) != 1);
  if($max_bpc ne "" && $max_bpc > 0) {
   &modetest_connector_write($connector_id,"max bpc",$max_bpc);
   &log("DRM: Set max bpc=$max_bpc on connector $connector_id");
@@ -516,9 +519,94 @@ sub apply_hdr_metadata_helper (@) {
 }
 
 ###############################################
+#           Renderer Lock Functions           #
+###############################################
+# Lock files live in $var_dir/locks: clean_files() empties $var_dir and
+# running/ on every renderer stop. A lock file deleted there let the next
+# caller lock a new inode while the first still held the old one: with rapid
+# WebUI applies two workers then started renderers at the same time and vc4
+# oopsed (drm_atomic_set_crtc_for_plane), leaving the renderer in D state
+# until a reboot. clean_files() only removes plain files, so locks/ survives.
+sub pgen_lock_path (@) {
+ my $name=shift;
+ my $dir="$var_dir/locks";
+ mkdir($dir) if(!-d $dir);
+ return "$dir/$name";
+}
+
+# Renderer start and stop form one critical section across threads and
+# processes (flock on separate opens). A nested call from the same thread
+# (stop -> video_program_stop -> start) only counts up.
+my $renderer_lock_fh;
+my $renderer_lock_depth=0;
+sub renderer_lock () {
+ return if($renderer_lock_depth++);
+ require Fcntl;
+ if(open($renderer_lock_fh,'>',&pgen_lock_path("renderer.lock"))) {
+  flock($renderer_lock_fh,Fcntl::LOCK_EX());
+ } else {
+  &log("Renderer: cannot open the renderer lock: $!");
+  undef $renderer_lock_fh;
+ }
+}
+
+sub renderer_unlock () {
+ return if($renderer_lock_depth <= 0 || --$renderer_lock_depth);
+ if($renderer_lock_fh) {
+  # LOCK_UN first: close() alone keeps the lock while a forked child still
+  # holds a copy of the descriptor.
+  flock($renderer_lock_fh,Fcntl::LOCK_UN());
+  close($renderer_lock_fh);
+ }
+ undef $renderer_lock_fh;
+}
+
+# A forked child shares the open lock descriptions of every thread of its
+# parent; flock locks belong to those, so the child would hold a lock it
+# does not know about and block on its own next renderer_lock(). Call this
+# first thing after fork().
+sub pgen_drop_inherited_locks () {
+ require POSIX;
+ # Release this thread's own handle through Perl first, so the scan below
+ # never closes a descriptor number twice.
+ undef $renderer_lock_fh;
+ $renderer_lock_depth=0;
+ (my $want=&pgen_lock_path(""))=~s{/+}{/}g;
+ $want=~s{/*$}{/};
+ if(opendir(my $fds,"/proc/self/fd")) {
+  my @fd=readdir($fds);
+  closedir($fds);
+  for my $fd (@fd) {
+   next if($fd !~ /^\d+$/ || $fd <= 2);
+   my $target=readlink("/proc/self/fd/$fd");
+   next if(!defined $target);
+   $target=~s{/+}{/}g;
+   POSIX::close($fd) if(index($target,$want) == 0);
+  }
+ }
+}
+
+###############################################
 #       Pattern Generator Start Function      #
 ###############################################
+# Serialized with pattern_generator_stop() by the renderer lock. A start is
+# skipped while a renderer already runs: a second renderer on the same CRTC
+# is what crashed vc4.
 sub pattern_generator_start(@) {
+ &renderer_lock();
+ if(&pattern_generator_is_running()) {
+  &log("Renderer: start skipped, a renderer is already running");
+  &renderer_unlock();
+  return;
+ }
+ my @args=@_;
+ my $ok=eval { &pattern_generator_start_locked(@args); 1 };
+ my $err=$@;
+ &renderer_unlock();
+ die $err if(!$ok);
+}
+
+sub pattern_generator_start_locked(@) {
  my $no_clean_files = shift;
  my $use_drm_override=1;
  my $has_dovi_metadata=1;
@@ -653,7 +741,17 @@ sub pattern_generator_start(@) {
 ###############################################
 #      Pattern Generator Stop Function        #
 ###############################################
+# Waits for a start in progress: killing a renderer before it holds DRM
+# master is the window the start path protects.
 sub pattern_generator_stop {
+ &renderer_lock();
+ my $ok=eval { &pattern_generator_stop_locked(); 1 };
+ my $err=$@;
+ &renderer_unlock();
+ die $err if(!$ok);
+}
+
+sub pattern_generator_stop_locked {
  my $pid = "";
  &video_program_stop("$program_video_to_kill");
  &process_pid("$pattern_generator","kill");

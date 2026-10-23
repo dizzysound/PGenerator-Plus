@@ -105,7 +105,11 @@ sub sync_pattern_bits_default (@) {
   $bits_default=8;
   return;
  }
- $bits_default=$conf_bits if($conf_bits == 8 || $conf_bits == 10 || $conf_bits == 12);
+ # Outside Dolby Vision the Pi 4 renderer sends 12 bpc out as 10 bpc from a
+ # 10-bit surface (LimitHDROutputTo10bpc). Keep pattern codes 10-bit so they
+ # reach the wire unchanged.
+ $bits_default=$conf_bits if($conf_bits == 8 || $conf_bits == 10);
+ $bits_default=10 if($conf_bits == 12);
 }
 
 ###############################################

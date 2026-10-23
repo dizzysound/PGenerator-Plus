@@ -1126,6 +1126,8 @@ sub pattern_daemon {
       my $cur_format="RGB 8-bit";
       my $cur_range="Full";
       my $cur_bits=$pgenerator_conf{"max_bpc"} || "8";
+      # Outside Dolby Vision 12 bpc goes out as 10 bpc (see sync_pattern_bits_default).
+      $cur_bits="10" if($cur_bits eq "12" && $pgenerator_conf{"dv_status"} ne "1");
       my $cur_dolby=($pgenerator_conf{"dv_status"} eq "1") ? "On" : "Off";
       # Parse current mode for refresh rate
       if($preferred_mode =~/(\d+)\[.*\s([\d.]+)Hz/) {

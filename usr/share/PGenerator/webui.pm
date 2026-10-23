@@ -1692,6 +1692,7 @@ sub webui_handle_request (@) {
          # unencoded default background -- green on a YPbPr wire.
          close($client);
          $SIG{CHLD}='DEFAULT';
+         &pgen_drop_inherited_locks();
          # Serialize apply workers: a failed retry ladder can run for
          # 30-40s, and a second apply's pattern_generator_stop() would
          # kill the renderer the first worker just started - the two
@@ -1701,8 +1702,9 @@ sub webui_handle_request (@) {
          &log("WebUI: apply worker started (pid $$)");
          my $pg_apply_lock;
          # The daemon runs as the pgenerator user: /var/lock is not
-         # writable, so the lock lives in the daemon's own state dir.
-         if(open($pg_apply_lock,'>',"$var_dir/running/webui-apply.lock")) {
+         # writable, so the lock lives in the daemon's own state dir
+         # (locks/, which clean_files() leaves alone).
+         if(open($pg_apply_lock,'>',&pgen_lock_path("webui-apply.lock"))) {
           flock($pg_apply_lock,2);
           &log("WebUI: apply worker holds the restart lock (pid $$)");
          } else {
