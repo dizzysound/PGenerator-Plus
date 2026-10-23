@@ -316,9 +316,9 @@ sub apply_drm_properties (@) {
  return if($connector_id eq "");
  # Set max bpc — the binary fails to apply this property
  my $max_bpc=$pgenerator_conf{"max_bpc"};
- # Outside Dolby Vision the renderer sends 12 bpc out as 10 (10 bit surface);
- # pre-set the same value so the first commit needs no extra modeset.
- $max_bpc=10 if($max_bpc eq "12" && int($pgenerator_conf{"dv_status"} || 0) != 1);
+ # Outside Dolby Vision the Pi 4 renderer sends 12 bpc out as 10 (10 bit
+ # surface); pre-set the same value so the first commit needs no extra modeset.
+ $max_bpc=&pg_wire_max_bpc($max_bpc) if($max_bpc eq "12");
  if($max_bpc ne "" && $max_bpc > 0) {
   &modetest_connector_write($connector_id,"max bpc",$max_bpc);
   &log("DRM: Set max bpc=$max_bpc on connector $connector_id");
@@ -537,6 +537,9 @@ sub pgen_lock_path (@) {
 # Renderer start and stop form one critical section across threads and
 # processes (flock on separate opens). A nested call from the same thread
 # (stop -> video_program_stop -> start) only counts up.
+# Both are per thread (ithreads clones file lexicals). A thread created while
+# its creator holds the lock would inherit depth 1 and skip locking, so create
+# threads outside start/stop.
 my $renderer_lock_fh;
 my $renderer_lock_depth=0;
 sub renderer_lock () {

@@ -19,7 +19,7 @@ use strict;
 use warnings;
 use FindBin qw($Bin);
 use File::Temp qw(tempdir);
-use Test::More tests => 50;
+use Test::More tests => 55;
 
 my $dir = "$Bin/../usr/share/PGenerator";
 ok(-f "$dir/pattern.pm", 'pattern.pm is present');
@@ -113,6 +113,23 @@ conf(max_bpc => 10);
 is($bits_default, 10, 'a 10 bpc link keeps 10-bit codes');
 conf(max_bpc => 8);
 is($bits_default, 8, 'an 8 bpc link keeps 8-bit codes');
+
+# The Pi 5 renderer has its own 12 bpc path and no drm_override.so, so only the
+# Pi 4 family sends 12 bpc as 10.
+{
+  our $device_model;
+  local $device_model = "Raspberry Pi 5 Model B Rev 1.0";
+  conf(max_bpc => 12);
+  is($bits_default, 12, 'a Pi 5 keeps 12-bit codes on a non-DV 12 bpc link');
+  is(pg_wire_max_bpc(12), 12, 'pg_wire_max_bpc leaves 12 alone on a Pi 5');
+  local $device_model = "Raspberry Pi 4 Model B Rev 1.4";
+  conf(max_bpc => 12);
+  is($bits_default, 10, 'a Pi 4 sends non-DV 12 bpc as 10');
+  conf(max_bpc => 12, dv_status => 1);
+  is(pg_wire_max_bpc(12), 12, 'pg_wire_max_bpc leaves 12 alone under Dolby Vision');
+}
+conf();
+is(pg_wire_max_bpc(8), 8, 'pg_wire_max_bpc passes 8 through');
 
 # --- the frame itself is full-screen black ---
 conf();

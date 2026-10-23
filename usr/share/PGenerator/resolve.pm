@@ -253,7 +253,10 @@ sub resolve_connect (@) {
   #
   # Sync bit depth from XML to PGenerator config if changed
   #
-  if($bits > 0 && $bits != $bits_default) {
+  # Compare the depth that reaches the wire: outside DV on a Pi 4 a 12-bit
+  # request and a 12 bpc conf both end up at 10, so neither needs a restart.
+  my $bits_wire=($bits == 12) ? &pg_wire_max_bpc($bits) : $bits;
+  if($bits > 0 && $bits_wire != $bits_default) {
    &resolve_save_setting("max_bpc","$bits");
    &pattern_generator_stop();
    &pattern_generator_start();

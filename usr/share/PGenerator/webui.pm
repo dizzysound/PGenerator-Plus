@@ -6072,6 +6072,7 @@ my $dv_interface=($signal_mode eq "dv") ? &pg_dv_transport_interface($request_dv
 	 my $series_transport_bits=int($pgenerator_conf{"max_bpc"}||$series_pattern_bits);
 	 $series_transport_bits=8 if($series_transport_bits!=8
 	  && $series_transport_bits!=10 && $series_transport_bits!=12);
+	 $series_transport_bits=&pg_wire_max_bpc($series_transport_bits);
 	 my $series_headroom_strategy="none";
 	 my $series_headroom_max=100;
 	 if($type eq "greyscale" && $signal_mode eq "sdr"
@@ -12705,6 +12706,8 @@ sub webui_idle_card_kit (@) {
 sub webui_idle_card_model (@) {
  # $hdmi_info is a per-thread copy from start-up; the info cache follows applies.
  my %conf=%pgenerator_conf;
+ # The card compares against the measured link: 12 bpc goes out as 10 outside DV on a Pi 4.
+ $conf{max_bpc}=&pg_wire_max_bpc($conf{max_bpc}) if(int($conf{max_bpc}||0) == 12);
  # Resolve transport through the renderer's policy, including retired values
  # that may still be present in a saved configuration.
  $conf{dv_transport}=&pg_dv_transport_mode($conf{dv_transport});

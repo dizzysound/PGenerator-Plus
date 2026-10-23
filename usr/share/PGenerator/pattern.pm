@@ -820,8 +820,9 @@ sub idle_pattern_text (@) {
  #
  # The cost is that set_values() feeds BITS back into avi_info.max_bpc, so the
  # idle link sits at 10 bpc until the first real pattern: the WebUI sends 10 for
- # a 12 bpc link anyway, and Calman's first BITS=12 patch restores 12 with a
- # window rebuild. Retain this compatibility fallback for those older binaries.
+ # a 12 bpc link anyway. Outside Dolby Vision on a Pi 4 the link is 10 bpc after
+ # this change regardless (pg_wire_max_bpc). Retain this compatibility fallback
+ # for older binaries.
  $bits=10 if($bits == 12);
  my $source_max=255;
  $source_max=1023 if($bits >= 10);
