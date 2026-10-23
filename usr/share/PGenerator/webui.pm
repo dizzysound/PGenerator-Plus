@@ -1563,11 +1563,30 @@ sub webui_handle_request (@) {
     }
     &log("WebUI: $method $path");
 
-   # CORS headers for API
-   my $cors="Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n";
+   # No CORS grant: the WebUI page is served by this host, so its own calls are
+   # same-origin. A wildcard grant let any web page open on the calibration PC
+   # read every response (the AP passphrase, the config) and, with text/plain
+   # bodies, post to it without a preflight.
+   my $cors="Connection: close\r\n";
+   # Browsers attach Origin to every cross-site POST. Refuse one that names a
+   # different host than the request was addressed to. Clients that send no
+   # Origin (curl, the device's own scripts, the automation runner, the ICC
+   # Companion, the deploy console) are unaffected.
+   my $origin_foreign=&webui_foreign_origin($method,$req);
 
    if($method eq "OPTIONS") {
     print $client "HTTP/1.1 204 No Content\r\n$cors\r\n";
+   }
+   elsif($origin_foreign) {
+    &log("WebUI: refused $method $path from foreign origin");
+    my $r='{"status":"error","message":"Cross-site request refused"}';
+    print $client "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: ".length($r)."\r\n$cors\r\n$r";
+   }
+   elsif(($path eq "/api/restart" || $path eq "/api/reboot" || $path eq "/api/power") && $method ne "POST") {
+    # A plain GET (an <img> tag on any page) must not restart the renderer or
+    # reboot or power off the device in the middle of a calibration session.
+    my $r='{"status":"error","message":"Use POST"}';
+    print $client "HTTP/1.1 405 Method Not Allowed\r\nAllow: POST\r\nContent-Type: application/json\r\nContent-Length: ".length($r)."\r\n$cors\r\n$r";
    }
    elsif(($path eq "/" || $path eq "/index.html") && $request_host=~/^pgenerator\.local(?::\d+)?$/i && $request_local_ip=~/^\d{1,3}(?:\.\d{1,3}){3}$/ && $request_local_ip ne "0.0.0.0") {
     my $redirect_path=$path;
@@ -10371,6 +10390,29 @@ sub webui_write_confirmed ($) {
  }
  return "Write confirmation header missing" unless($req=~/^X-PGenerator-Write:/mi);
  return "";
+}
+
+# Cross-site write guard for the whole WebUI. A browser sends Origin with every
+# cross-site POST/PUT, and a page cannot forge or strip it. True when the
+# request is a write whose Origin does not name the host the request was
+# addressed to (a missing or "null" host counts as foreign). Reads, preflights
+# and requests without Origin (non-browser clients) are never foreign.
+sub webui_foreign_origin ($$) {
+ my ($method,$req)=@_;
+ return 0 if(!defined($method) || ($method ne "POST" && $method ne "PUT"));
+ my $origin="";
+ $origin=$1 if($req=~/^Origin:[ \t]*(\S+)[ \t]*\r?$/mi);
+ return 0 if($origin eq "");
+ my $host="";
+ $host=lc($1) if($req=~/^Host:[ \t]*([A-Za-z0-9._\-\[\]:]+)[ \t]*\r?$/mi);
+ my ($scheme,$origin_host)=$origin=~m{^(https?)://([^/]+)$}i;
+ return 1 if(!defined($origin_host));
+ $origin_host=lc($origin_host);
+ # Browsers drop the default port from both Origin and Host; normalize anyway.
+ my $default_port=(lc($scheme) eq "https") ? 443 : 80;
+ $origin_host=~s/:$default_port$//;
+ $host=~s/:$default_port$//;
+ return ($host eq "" || $origin_host ne $host) ? 1 : 0;
 }
 
 # ── OTA / release-notification source repo ──

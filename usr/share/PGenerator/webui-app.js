@@ -1642,7 +1642,7 @@ async function hdmiRecheck(){
     if(!info.hdmi_port.wrong_port){
      btn.textContent='Restarting display\u2026';
      // Restart pattern generator so it re-targets the correct connector
-     await fetchJSON('/api/restart',{_timeoutMs:10000}).catch(function(){});
+     await fetchJSON('/api/restart',{method:'POST',_timeoutMs:10000}).catch(function(){});
      _hdmiIgnored=false;
      document.getElementById('hdmiOverlay').classList.remove('active');
     uiSyncBodyScrollLock();
